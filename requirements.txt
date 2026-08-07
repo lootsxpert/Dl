@@ -1,0 +1,7 @@
+Pyrogram==2.0.106
+TgCrypto==1.2.5
+aiohttp==3.9.3
+certifi
+Quart>=0.20
+python-dotenv
+motor
