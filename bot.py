@@ -93,13 +93,13 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
 PREMIUM_PLANS = {
-    "day": {"label": "1 Day", "amount_inr": 3, "days": 1, "stars": 10},
-    "week": {"label": "1 Week", "amount_inr": 20, "days": 7, "stars": 50},
-    "month": {"label": "1 Month", "amount_inr": 65, "days": 30, "stars": 140},
-    "quarter": {"label": "3 Months", "amount_inr": 150, "days": 90, "stars": 300},
+    "day": {"label": "1 Day", "amount_inr": 5, "days": 1, "stars": 10},
+    "week": {"label": "1 Week", "amount_inr": 30, "days": 7, "stars": 60},
+    "month": {"label": "1 Month", "amount_inr": 100, "days": 30, "stars": 200},
+    "quarter": {"label": "3 Months", "amount_inr": 250, "days": 90, "stars": 500},
     "quota50": {
         "label": "Quota Top-up (+50 today)",
-        "amount_inr": 3,
+        "amount_inr": 5,
         "days": 0,
         "stars": 10,
         "quota_add": 50,
