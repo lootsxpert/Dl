@@ -3162,7 +3162,7 @@ async def player(token: str):
     size_mb = data.get("size_mb") or 0
     quality = html.escape(data.get("quality") or "")
     bot_username = html.escape(_current_bot_username() or "DiskWalaBot")
-    loot_deals_url = "https://t.me/+SVbNsGtmvfUzYzNl"
+    loot_deals_url = "https://t.me/+Y_5g_YiHTA9lMTZl"
 
     page = f"""<!doctype html>
 <html>
