@@ -25,6 +25,7 @@ from pyrogram.errors import (
     InputUserDeactivated,
     PeerIdInvalid,
     MessageNotModified,
+    WebpageMediaEmpty,
 )
 from pyrogram.enums import ChatMemberStatus
 import aiohttp
@@ -153,6 +154,7 @@ _file_transfer_jobs: dict[str, dict] = {}
 # In-memory admin toggles (not persisted; reset on restart)
 QUOTA_ENABLED = True  # /shortlink_on|off - when False, free users must buy premium after free quota
 FREE_MODE_ENABLED = False  # /freemode_on|off - when True, bot is free for everyone
+SENDFILE_ENABLED = True  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
 
 # In-memory per-API usage/health counters (not persisted; reset on restart).
 # api_key -> {attempts, success, fail, consecutive_fails, last_ok_at, last_fail_at, last_error}
@@ -229,9 +231,20 @@ async def _get_premium_until(user_id: int) -> datetime | None:
     return None
 
 
+def _is_admin_user(user_id: int) -> bool:
+    return int(user_id) in ADMIN_USER_IDS
+
+
 async def _is_premium_user(user_id: int) -> bool:
     premium_until = await _get_premium_until(user_id)
     return bool(premium_until and premium_until > _utc_now())
+
+
+async def _has_premium_access(user_id: int) -> bool:
+    """Premium subscribers and env-configured admins get premium-only features."""
+    if _is_admin_user(user_id):
+        return True
+    return await _is_premium_user(user_id)
 
 
 async def _upsert_user_profile(user, bot_key: str) -> None:
@@ -503,6 +516,9 @@ async def _status_text(bot_key: str) -> str:
             f"Total users: {total_users}\n"
             "Premium users: DB not enabled\n"
             f"In-memory users today: {total_users}\n\n"
+            f"Toggles: quota={'on' if QUOTA_ENABLED else 'off'} | "
+            f"freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+            f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
             f"{api_text}"
         )
     now = _utc_now()
@@ -516,6 +532,9 @@ async def _status_text(bot_key: str) -> str:
         f"Premium active users: {premium_users}\n"
         f"Premium expired users: {expired_premium_users}\n"
         f"Active users (last 24h): {active_today}\n\n"
+        f"Toggles: quota={'on' if QUOTA_ENABLED else 'off'} | "
+        f"freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+        f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
         f"{api_text}"
     )
 
@@ -1032,20 +1051,18 @@ def _file_options_caption(name: str, size_mb: float, *, has_stream: bool = False
         f"📁 {name}",
         size_line,
         "",
-        # Get File disabled — download/upload too slow; Watch Online only
-        # "Choose an option:",
-        # "1️⃣ Get File — sent here (auto-deleted in 45 min)",
-        "▶️ Watch Online — stream in web app",
+        "Choose an option:",
     ]
-    # if has_stream and PUBLIC_BASE_URL:
-    #     lines.append("2️⃣ Watch Online — stream in web app")
-    # if size_mb > TELEGRAM_MAX_UPLOAD_MB:
-    #     lines.append(
-    #         f"\n⚠️ File exceeds Telegram upload limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). "
-    #         "Use Watch Online if Get File fails."
-    #     )
-    if not (has_stream and PUBLIC_BASE_URL):
-        lines.append("\n⚠️ Online streaming is currently unavailable for this file.")
+    if has_stream and PUBLIC_BASE_URL:
+        lines.append("▶️ Watch Now (Free) — stream in web app")
+    else:
+        lines.append("▶️ Watch Now (Free) — unavailable for this file")
+    lines.append("📥 Get File (Premium) — sent here (auto-deleted in 45 min)")
+    if size_mb > TELEGRAM_MAX_UPLOAD_MB:
+        lines.append(
+            f"\n⚠️ File exceeds Telegram upload limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). "
+            "Use Watch Now if Get File fails."
+        )
     return "\n".join(lines)
 
 
@@ -1058,12 +1075,6 @@ def _build_file_options_markup(
     download_url: str,
 ) -> InlineKeyboardMarkup | None:
     rows = []
-    # Get File disabled — download/upload too slow; keep for later restore
-    # if _is_valid_http_url(download_url):
-    #     rows.append([InlineKeyboardButton(
-    #         "📥 Get File (45 min)",
-    #         callback_data=f"gfile:{file_token}",
-    #     )])
     if stream and PUBLIC_BASE_URL:
         stoken = create_stream_token(
             stream, name=name, size_mb=size_mb, download_url=download_url or "", quality="480p",
@@ -1071,10 +1082,59 @@ def _build_file_options_markup(
         web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
         if _is_valid_https_url(web_app_url):
             rows.append([InlineKeyboardButton(
-                "▶️ Watch Online (Web App)",
+                "▶️ Watch Now (Free)",
                 web_app=WebAppInfo(url=web_app_url),
             )])
+    if _is_valid_http_url(download_url):
+        rows.append([InlineKeyboardButton(
+            "📥 Get File (Premium)",
+            callback_data=f"gfile:{file_token}",
+        )])
     return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _send_file_options_message(
+    client: Client,
+    message,
+    msg,
+    *,
+    caption: str,
+    markup: InlineKeyboardMarkup,
+    thumbnail: str,
+) -> None:
+    """Send file options; use thumbnail when valid, otherwise fall back to text-only."""
+    if thumbnail and _is_valid_http_url(thumbnail):
+        deleted_fetch_msg = False
+        try:
+            await msg.delete()
+            deleted_fetch_msg = True
+        except Exception:
+            pass
+        try:
+            info = await client.send_photo(
+                message.chat.id,
+                photo=thumbnail.strip(),
+                caption=caption,
+                reply_markup=markup,
+            )
+            _schedule_expire_media_message(client, info.chat.id, info.id)
+            return
+        except (WebpageMediaEmpty, Exception):
+            if deleted_fetch_msg:
+                msg = None
+
+    if msg is not None:
+        try:
+            await msg.edit(caption, reply_markup=markup)
+            _schedule_disable_and_mark_expired(client, msg.chat.id, msg.id, is_caption=False)
+            return
+        except Exception:
+            pass
+
+    info = await message.reply(caption, reply_markup=markup)
+    _schedule_disable_and_mark_expired(
+        client, info.chat.id, info.id, is_caption=bool(getattr(info, "caption", None)),
+    )
 
 
 def _expired_text() -> str:
@@ -1862,9 +1922,6 @@ async def start(client, message):
             pass
         return
 
-    if not await _ensure_joined(client, message):
-        return
-
     # 🔓 Unlock flow
     if len(args) > 1:
         token = args[1]
@@ -1971,6 +2028,28 @@ async def freemode_off_cmd(client, message):
         return await message.reply("❌ You are not allowed to use this command.")
     FREE_MODE_ENABLED = False
     await message.reply("✅ Free mode DISABLED. Normal quota/premium rules apply again.")
+
+
+@app.on_message(filters.command("sendfile_on"))
+async def sendfile_on_cmd(client, message):
+    global SENDFILE_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    SENDFILE_ENABLED = True
+    await message.reply("✅ Get File (Premium) ENABLED. Premium users can download files again.")
+
+
+@app.on_message(filters.command("sendfile_off"))
+async def sendfile_off_cmd(client, message):
+    global SENDFILE_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    SENDFILE_ENABLED = False
+    await message.reply(
+        "✅ Get File (Premium) DISABLED. The button stays visible, but users see a temporary-closed popup."
+    )
 
 
 @app.on_message(filters.command("broadcast"))
@@ -2157,6 +2236,7 @@ def _format_api_usage(data: dict) -> str:
 @app.on_message(filters.private & ~filters.command([
     "start", "premium", "myplan", "status", "usage", "broadcast",
     "shortlink_on", "shortlink_off", "freemode_on", "freemode_off",
+    "sendfile_on", "sendfile_off",
 ]))
 async def diskwala(client, message):
     user_id = message.from_user.id
@@ -2250,24 +2330,14 @@ async def diskwala(client, message):
                 )
                 continue
 
-            if thumbnail and _is_valid_http_url(thumbnail):
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
-                info = await client.send_photo(
-                    message.chat.id,
-                    photo=thumbnail.strip(),
-                    caption=caption,
-                    reply_markup=markup,
-                )
-                _schedule_expire_media_message(client, info.chat.id, info.id)
-            else:
-                await msg.edit(
-                    caption,
-                    reply_markup=markup,
-                )
-                _schedule_disable_and_mark_expired(client, msg.chat.id, msg.id, is_caption=False)
+            await _send_file_options_message(
+                client,
+                message,
+                msg,
+                caption=caption,
+                markup=markup,
+                thumbnail=thumbnail,
+            )
 
     except Exception as e:
         await report_error(client, "diskwala_handler", e, extra={"user_id": user_id})
@@ -2290,6 +2360,17 @@ async def get_file_cb(client, callback_query):
     if int(data.get("user_id", 0)) != user_id:
         return await callback_query.answer("Not your request.", show_alert=True)
 
+    if not await _has_premium_access(user_id):
+        return await callback_query.answer(
+            "Get File is a Premium feature. Use /premium to upgrade.",
+            show_alert=True,
+        )
+    if not SENDFILE_ENABLED:
+        return await callback_query.answer(
+            "Admin has temporarily closed Get File. Please try again later.",
+            show_alert=True,
+        )
+
     link = (data.get("link") or "").strip()
     name = data.get("name") or "file"
     size_mb = float(data.get("size_mb") or 0)
@@ -2302,11 +2383,14 @@ async def get_file_cb(client, callback_query):
     if not _is_valid_http_url(link):
         return await callback_query.answer("File URL unavailable.", show_alert=True)
 
-    await callback_query.answer("Starting…")
+    await callback_query.answer("Starting premium file transfer…")
 
     job_id = "".join(random.choices("0123456789abcdef", k=8))
     _file_transfer_jobs[job_id] = {"cancel": asyncio.Event(), "user_id": user_id}
     est_total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
+    est_eta_note = ""
+    if size_mb > 0:
+        est_eta_note = f"\nEstimated size: {size_mb} MB — speed and ETA update live below."
 
     progress_msg = await callback_query.message.reply(
         _transfer_progress_text(
@@ -2317,7 +2401,7 @@ async def get_file_cb(client, callback_query):
             total=est_total,
             speed_bps=0,
             elapsed=0,
-        ),
+        ) + est_eta_note,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
         ]),
@@ -3130,18 +3214,78 @@ async def player(token: str):
       .hint {{ display: flex; gap: 10px; margin: 0 14px 14px; padding: 12px; border-radius: 12px;
         background: #10162494; border: 1px solid #1c2333; font-size: 12px; line-height: 1.5; color: #b9c0d1; }}
       .hint svg {{ width: 16px; height: 16px; stroke: #8b93a7; fill: none; stroke-width: 2; flex-shrink: 0; margin-top: 1px; }}
-      .promo {{ margin: 0 14px 14px; padding: 16px; border-radius: 14px;
-        background: linear-gradient(135deg, #171233, #0f1a33); border: 1px solid #262a52; }}
-      .promo-head {{ display: flex; align-items: center; gap: 10px; }}
-      .promo-head .p-title {{ font-size: 15px; font-weight: 700; flex: 1; }}
-      .promo p {{ font-size: 12.5px; color: #b9c0d1; line-height: 1.5; margin: 8px 0 14px; }}
-      .promo-links a {{ display: flex; align-items: center; gap: 10px; padding: 12px; border-radius: 10px;
-        text-decoration: none; color: #fff; font-size: 13.5px; font-weight: 700; line-height: 1.3;
-        background: #1471ef; box-shadow: 0 4px 14px rgba(20,113,239,0.35); }}
-      .promo-links .ic {{ width: 34px; height: 34px; border-radius: 50%; background: rgba(255,255,255,0.18);
-        display: flex; align-items: center; justify-content: center; flex-shrink: 0; }}
-      .promo-links svg {{ width: 16px; height: 16px; fill: #fff; }}
-      .promo-links small {{ display: block; font-weight: 400; opacity: 0.85; font-size: 11.5px; margin-top: 1px; }}
+      .promo {{
+        margin: 0 14px 14px;
+        padding: 0;
+        border-radius: 16px;
+        overflow: hidden;
+        position: relative;
+        background: radial-gradient(120% 140% at 15% 0%, #3a1440 0%, #1a0f2e 35%, #0d1224 70%, #0b0f1e 100%);
+        border: 1px solid rgba(255, 183, 77, 0.35);
+        box-shadow: 0 8px 32px rgba(255, 90, 0, 0.18), inset 0 1px 0 rgba(255,255,255,0.06);
+      }}
+      .promo-top {{ padding: 16px 16px 12px; text-align: center; }}
+      .promo-flash {{
+        display: inline-flex; align-items: center; gap: 5px;
+        background: linear-gradient(135deg, #ff6d00, #ff2d55);
+        color: #fff; font-weight: 800; font-size: 10.5px; letter-spacing: 0.4px;
+        padding: 4px 10px; border-radius: 999px; margin-bottom: 10px;
+        box-shadow: 0 4px 14px rgba(255,45,85,0.35);
+      }}
+      .promo-title {{
+        font-size: 20px; font-weight: 900; line-height: 1.2; letter-spacing: -0.3px;
+        background: linear-gradient(135deg, #ffd580, #ff9900 55%, #ff5e3a);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+      }}
+      .promo-sub {{ font-size: 12.5px; color: #d6dae8; margin-top: 8px; line-height: 1.5; }}
+      .promo-sub b {{ color: #ffb74d; font-weight: 800; }}
+      .promo-body {{ padding: 4px 16px 16px; }}
+      .promo-pills {{
+        display: flex; gap: 8px; margin-bottom: 14px;
+      }}
+      .promo-pill {{
+        flex: 1; text-align: center; text-decoration: none;
+        font-size: 11px; font-weight: 800; padding: 9px 6px; border-radius: 999px;
+        color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }}
+      .promo-pill.loot {{ background: linear-gradient(135deg, #ff6d00, #ff9100); box-shadow: 0 4px 12px rgba(255,109,0,0.3); }}
+      .promo-pill.error {{ background: linear-gradient(135deg, #00c853, #00a844); box-shadow: 0 4px 12px rgba(0,200,83,0.3); }}
+      .promo-pill.hidden {{ background: linear-gradient(135deg, #7c4dff, #b388ff); box-shadow: 0 4px 12px rgba(124,77,255,0.3); }}
+      .promo-cta {{
+        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        padding: 14px 16px; border-radius: 14px; text-decoration: none; color: #fff;
+        background: linear-gradient(135deg, #0088cc 0%, #229ed9 100%);
+        box-shadow: 0 6px 20px rgba(0,136,204,0.4);
+        border: 1px solid rgba(255,255,255,0.15);
+        margin-bottom: 14px;
+      }}
+      .promo-cta:active {{ transform: scale(0.98); }}
+      .promo-cta .cta-left {{ display: flex; align-items: center; gap: 10px; min-width: 0; }}
+      .promo-cta .ic {{
+        width: 38px; height: 38px; border-radius: 50%;
+        background: rgba(255,255,255,0.2);
+        display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      }}
+      .promo-cta svg {{ width: 18px; height: 18px; fill: #fff; }}
+      .promo-cta .cta-text {{ font-size: 14.5px; font-weight: 800; line-height: 1.3; }}
+      .promo-cta .cta-text small {{ display: block; font-weight: 500; opacity: 0.9; font-size: 11px; margin-top: 2px; }}
+      .promo-cta .arrow {{
+        width: 26px; height: 26px; border-radius: 50%; background: rgba(255,255,255,0.18);
+        display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      }}
+      .promo-cta .arrow svg {{ width: 13px; height: 13px; stroke: #fff; fill: none; stroke-width: 2.5; }}
+      .promo-social {{ display: flex; align-items: center; justify-content: center; gap: 10px; }}
+      .promo-social .avatars {{ display: flex; }}
+      .promo-social .avatars span {{
+        width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center;
+        justify-content: center; font-size: 13px; border: 2px solid #1a0f2e; margin-left: -8px;
+      }}
+      .promo-social .avatars span:first-child {{ margin-left: 0; }}
+      .promo-social .avatars span:nth-child(1) {{ background: #ffb74d; }}
+      .promo-social .avatars span:nth-child(2) {{ background: #7c4dff; }}
+      .promo-social .avatars span:nth-child(3) {{ background: #ff5e7d; }}
+      .promo-social .avatars span:nth-child(4) {{ background: #00c853; font-size: 9px; font-weight: 800; color: #fff; }}
+      .promo-social .count {{ font-size: 11.5px; font-weight: 700; color: #ffb74d; }}
       .footer {{ text-align: center; padding: 16px; font-size: 12px; color: #6ea8ff; }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
@@ -3192,15 +3336,28 @@ async def player(token: str):
       </div>
 
       <div class="promo">
-        <div class="promo-head">
-          <span>✨</span><span class="p-title">Stay Updated. Never Miss a Deal 🛍️!</span>
+        <div class="promo-top">
+          <div class="promo-flash">⚡ LIMITED TIME</div>
+          <div class="promo-title">🔥 BIG DEALS LIVE NOW!</div>
+          <div class="promo-sub">Up to <b>90% OFF</b> on Amazon, Flipkart, Myntra &amp; Ajio</div>
         </div>
-        <p>Up to 90% off Deals from Amazon Flipkart Ajio Myntra. Must Join</p>
-        <div class="promo-links">
-          <a href="{loot_deals_url}" target="_blank">
-            <span class="ic"><svg viewBox="0 0 24 24"><path d="M21 3L3 10.5l6.5 2.5L12 21l3-6 6-12z"/></svg></span>
-            <span>Join Loot Deals<small>Best Deals &amp; Offers</small></span>
+        <div class="promo-body">
+          <div class="promo-pills">
+            <a class="promo-pill loot" href="{loot_deals_url}" target="_blank">🔥 Loot Deals</a>
+            <a class="promo-pill error" href="{loot_deals_url}" target="_blank">$ Error Price</a>
+            <a class="promo-pill hidden" href="{loot_deals_url}" target="_blank">🎁 Hidden Coupons</a>
+          </div>
+          <a class="promo-cta" href="{loot_deals_url}" target="_blank">
+            <span class="cta-left">
+              <span class="ic"><svg viewBox="0 0 24 24"><path d="M21 3L3 10.5l6.5 2.5L12 21l3-6 6-12z"/></svg></span>
+              <span class="cta-text">Join Deal Channel<small>Best Deals &amp; Offers Daily</small></span>
+            </span>
+            <span class="arrow"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
           </a>
+          <div class="promo-social">
+            <div class="avatars"><span>🧑</span><span>👩</span><span>🧔</span><span>99+</span></div>
+            <div class="count">120K+ Smart Shoppers</div>
+          </div>
         </div>
       </div>
 
