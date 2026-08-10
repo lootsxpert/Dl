@@ -3155,7 +3155,10 @@ async def player(token: str):
     if not data or data.get("expires_at", 0) <= _now_ts():
         return Response("Stream link expired. Go back to the bot and generate again.", status=410)
 
-    # We route the playback through our proxy to avoid CORS issues in Telegram WebView.
+    # Try the upstream CDN directly first (0 Render/Railway bandwidth). Only fall back
+    # to our /hls proxy client-side if direct playback actually fails (e.g. no CORS
+    # headers from that source) — see fallback logic in the player script below.
+    direct_src = data['url']
     proxied_m3u8 = f"/hls?u={quote_plus(data['url'])}"
 
     file_name = html.escape(data.get("name") or "video.mp4")
@@ -3365,16 +3368,40 @@ async def player(token: str):
     </div>
     <script>
       const video = document.getElementById('v');
-      const src = {proxied_m3u8!r};
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-        video.src = src;
-      }} else if (window.Hls && Hls.isSupported()) {{
-        const hls = new Hls({{ enableWorker: true, lowLatencyMode: true }});
-        hls.loadSource(src);
-        hls.attachMedia(video);
-      }} else {{
-        document.querySelector('.hint div').textContent = 'HLS not supported in this webview.';
+      const directSrc = {direct_src!r};
+      const proxiedSrc = {proxied_m3u8!r};
+      let usingProxy = false;
+      let currentHls = null;
+
+      function loadSrc(url, isProxy) {{
+        usingProxy = isProxy;
+        if (currentHls) {{
+          currentHls.destroy();
+          currentHls = null;
+        }}
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+          video.src = url;
+        }} else if (window.Hls && Hls.isSupported()) {{
+          const hls = new Hls({{ enableWorker: true, lowLatencyMode: true }});
+          currentHls = hls;
+          hls.loadSource(url);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.ERROR, (_evt, data) => {{
+            if (data.fatal && !usingProxy) {{
+              loadSrc(proxiedSrc, true);
+            }}
+          }});
+        }} else {{
+          document.querySelector('.hint div').textContent = 'HLS not supported in this webview.';
+        }}
       }}
+
+      // Direct-from-CDN first (saves bandwidth); silently fall back to the
+      // proxy on real playback failure (e.g. source has no CORS headers).
+      video.addEventListener('error', () => {{
+        if (!usingProxy) loadSrc(proxiedSrc, true);
+      }});
+      loadSrc(directSrc, false);
 
       function fmt(t) {{
         if (!isFinite(t) || t < 0) t = 0;
@@ -3426,23 +3453,44 @@ async def player(token: str):
     return Response(page, mimetype="text/html")
 
 
+_HLS_FORWARD_RESPONSE_HEADERS = ("Content-Range", "Accept-Ranges")
+
+
 @bot.get("/hls")
 async def hls_proxy():
     """
     Proxy + rewrite m3u8/segments to same-origin URLs to avoid WebView CORS issues.
+
+    Manifests are small and get fully buffered (needed to rewrite segment URLs).
+    Everything else (.ts/.aac/.mp4 chunks) is streamed straight through without
+    buffering the whole body in memory, and incoming Range requests are forwarded
+    upstream so video seeking doesn't force a full-file re-download/re-serve.
     """
     u = request.args.get("u", "")
     if not u:
         return Response("Missing url", status=400)
 
     upstream = unquote_plus(u)
-    async with aiohttp.ClientSession() as session:
-        async with session.get(upstream) as resp:
-            content_type = resp.headers.get("content-type", "")
-            body = await resp.read()
+    range_header = request.headers.get("Range")
 
-    # If it's an m3u8, rewrite segment URLs to route back through this proxy.
-    if "application/vnd.apple.mpegurl" in content_type or upstream.endswith(".m3u8"):
+    session = aiohttp.ClientSession()
+    try:
+        resp_cm = session.get(upstream, headers={"Range": range_header} if range_header else None)
+        resp = await resp_cm.__aenter__()
+    except Exception:
+        await session.close()
+        return Response("Upstream fetch failed", status=502)
+
+    content_type = resp.headers.get("content-type", "")
+    is_manifest = "application/vnd.apple.mpegurl" in content_type or upstream.endswith(".m3u8")
+
+    if is_manifest:
+        try:
+            body = await resp.read()
+        finally:
+            await resp_cm.__aexit__(None, None, None)
+            await session.close()
+
         try:
             text = body.decode("utf-8", errors="ignore")
         except Exception:
@@ -3458,8 +3506,21 @@ async def hls_proxy():
 
         return Response("\n".join(out_lines) + "\n", content_type="application/vnd.apple.mpegurl")
 
-    # For .ts/.aac/.mp4 chunks etc, stream bytes as-is.
-    return Response(body, content_type=content_type or "application/octet-stream")
+    status = resp.status
+    out_headers = {
+        name: resp.headers[name] for name in _HLS_FORWARD_RESPONSE_HEADERS if name in resp.headers
+    }
+
+    async def body_stream():
+        try:
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                yield chunk
+        finally:
+            await resp_cm.__aexit__(None, None, None)
+            await session.close()
+
+    return Response(body_stream(), status=status, headers=out_headers,
+                     content_type=content_type or "application/octet-stream")
 
 
 @bot.get("/health")
