@@ -1,0 +1,52 @@
+services:
+  - type: web
+    name: diskwala-dl-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      # sync: false means "set the value in the Render dashboard", so no
+      # secret is ever committed to the repo.
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: TERABOXDL_API_KEY
+        sync: false
+      - key: TERABOXDL_API_BASE
+        value: https://api.teraboxdl.site
+      - key: TERABOXDL_API_PATH
+        value: /api/v1/diskwala/extract
+      - key: DISKWALA_API_KEY
+        sync: false
+      - key: DISKWALA_API_BASE
+        sync: false
+      - key: SHORTLINK_API
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: FORCE_SUB_CHANNEL
+        sync: false
+      - key: FORCE_SUB_INVITE_URL
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: ADMIN_USER_ID
+        sync: false
+      - key: ADMIN_CONTACT_BOT
+        sync: false
+      - key: PREMIUM_DAILY_DOWNLOADS
+        value: "50"
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB_NAME
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false

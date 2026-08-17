@@ -3756,6 +3756,8 @@ async def after_serving():
 
 # bot.run(port=8000)
 if __name__ == '__main__':
+    # Render (and most PaaS) inject the bind port via $PORT.
+    port = int(os.getenv("PORT", "8080"))
     loop = asyncio.get_event_loop()
-    loop.create_task(bot.run_task(host='0.0.0.0', port=8080))
+    loop.create_task(bot.run_task(host='0.0.0.0', port=port))
     loop.run_forever()

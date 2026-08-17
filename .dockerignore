@@ -1,0 +1,17 @@
+# Secrets - set these as environment variables in Render instead.
+.env
+.env.*
+
+# Pyrogram session state must not be baked into the image.
+*.session
+*.session-journal
+
+__pycache__/
+*.py[cod]
+downloads/
+.git/
+.gitignore
+.vscode/
+
+# Local scratch copy, not deployed.
+working.py
