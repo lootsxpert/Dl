@@ -82,6 +82,10 @@ API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DISKWALA_API_KEY = os.getenv("DISKWALA_API_KEY", "").strip()
 DISKWALA_API_BASE = os.getenv("DISKWALA_API_BASE", "http://teradl.kingx.dev:8080").strip().rstrip("/")
+# Primary provider (teraboxdl.site) - HMAC signed requests.
+TERABOXDL_API_BASE = os.getenv("TERABOXDL_API_BASE", "https://api.teraboxdl.site").strip().rstrip("/")
+TERABOXDL_API_KEY = os.getenv("TERABOXDL_API_KEY", "").strip()
+TERABOXDL_API_SECRET = os.getenv("TERABOXDL_API_SECRET", "").strip()
 SHORTLINK_API = os.getenv('SHORTLINK_API')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
@@ -485,7 +489,8 @@ def _format_ago(ts: float | None) -> str:
 
 def _api_status_text() -> str:
     labels = [
-        ("diskwala", "DiskWala API"),
+        ("teraboxdl", "TeraboxDL API (primary)"),
+        ("diskwala", "DiskWala API (fallback)"),
     ]
     lines = ["🔌 API Health & Usage"]
     for key, label in labels:
@@ -1691,7 +1696,96 @@ def _normalize_diskwala_filename(data: dict) -> str:
     return name or f"file.{ext}"
 
 
+def _teraboxdl_headers(body: str) -> dict:
+    timestamp = str(int(time.time()))
+    message = f"POST/v1/api{timestamp}{body}"
+    signature = hmac.new(
+        TERABOXDL_API_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        "Content-Type": "application/json",
+        "X-API-Key": TERABOXDL_API_KEY,
+        "X-Timestamp": timestamp,
+        "X-Signature": signature,
+    }
+
+
+async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
+    """Primary provider: api.teraboxdl.site (HMAC-SHA256 signed POST)."""
+    if not (TERABOXDL_API_KEY and TERABOXDL_API_SECRET):
+        return None, "TeraboxDL API credentials are not configured."
+
+    body = json.dumps({"url": url, "dir_path": "", "page": 1}, separators=(",", ":"))
+    try:
+        timeout = aiohttp.ClientTimeout(total=40)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{TERABOXDL_API_BASE}/v1/api",
+                headers=_teraboxdl_headers(body),
+                data=body,
+            ) as resp:
+                if resp.status != 200:
+                    text = (await resp.text())[:200]
+                    _record_api_result("teraboxdl", False, f"HTTP {resp.status} {text}")
+                    return None, f"API error HTTP {resp.status}"
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        _record_api_result("teraboxdl", False, f"{type(e).__name__}: {e}")
+        return None, "Failed to fetch data."
+
+    if not isinstance(data, dict):
+        _record_api_result("teraboxdl", False, "invalid response")
+        return None, "Failed to fetch data."
+
+    if str(data.get("status") or "").lower() not in ("success", "ok", ""):
+        api_msg = data.get("message") or data.get("error") or "API returned an error."
+        _record_api_result("teraboxdl", False, str(api_msg))
+        return None, str(api_msg)
+
+    info = ((data.get("data") or {}).get("fileInfo")) or {}
+    if not isinstance(info, dict):
+        info = {}
+    direct_url = (info.get("url") or "").strip()
+    if not direct_url:
+        api_msg = data.get("message") or data.get("error") or "No direct url in response."
+        _record_api_result("teraboxdl", False, str(api_msg))
+        return None, str(api_msg)
+
+    size_bytes = int(info.get("size") or 0)
+    full_name = _normalize_diskwala_filename(info)
+    thumbnail = (info.get("thumb") or info.get("thumbnail") or "").strip()
+    media_type = (info.get("type") or "").lower()
+    stream = direct_url if media_type.startswith("video") else ""
+
+    _record_api_result("teraboxdl", True)
+    return {
+        "name": full_name,
+        "size_mb": round(size_bytes / 1024 / 1024, 2),
+        "link": direct_url,
+        "stream": stream,
+        "thumbnail": thumbnail,
+        "source": "teraboxdl",
+        "credits_remaining": data.get("credits_remaining"),
+    }, ""
+
+
 async def fetch_diskwala_link(url: str) -> tuple[dict | None, str]:
+    """Try primary (teraboxdl), fall back to DiskWala/kingx on failure."""
+    result, err = await fetch_teraboxdl_link(url)
+    if result:
+        return result, ""
+    primary_err = err
+
+    result, err = await _fetch_kingx_link(url)
+    if result:
+        return result, ""
+    logger.warning("Both APIs failed. primary=%s fallback=%s", primary_err, err)
+    return None, err or primary_err
+
+
+async def _fetch_kingx_link(url: str) -> tuple[dict | None, str]:
     if not DISKWALA_API_KEY:
         return None, "DiskWala API key is not configured."
 
