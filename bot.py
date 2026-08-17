@@ -1879,7 +1879,11 @@ async def fetch_diskwala_link(url: str) -> tuple[dict | None, str]:
     if result:
         return result, ""
     logger.warning("Both APIs failed. primary=%s fallback=%s", primary_err, err)
-    return None, err or primary_err
+    # Surface the primary provider's error. The legacy kingx fallback is dead
+    # and its "HTTP 522" tells the user (and us) nothing about the real cause.
+    if primary_err and err:
+        return None, f"{primary_err} (fallback: {err})"
+    return None, primary_err or err
 
 
 async def _fetch_kingx_link(url: str) -> tuple[dict | None, str]:
@@ -3378,6 +3382,17 @@ async def player(token: str):
       .header .titles .s {{ font-size: 12px; color: #8b93a7; margin-top: 2px; }}
       .player {{ position: relative; margin: 14px; border-radius: 14px; overflow: hidden; background: #000; }}
       video {{ width: 100%; display: block; aspect-ratio: 16/9; background: #000; }}
+      /* Telegram's WebView blocks requestFullscreen() on a container element,
+         so this CSS overlay is the fallback "fullscreen" for that case. */
+      .player.fake-fs {{ position: fixed; inset: 0; margin: 0; border-radius: 0; z-index: 9999;
+        display: flex; align-items: center; justify-content: center; }}
+      .player.fake-fs video {{ width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }}
+      body.fs-lock {{ overflow: hidden; }}
+      /* Native fullscreen path: stretch the video to the whole screen too. */
+      .player:fullscreen {{ margin: 0; border-radius: 0; display: flex; align-items: center; justify-content: center; }}
+      .player:fullscreen video {{ width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }}
+      .player:-webkit-full-screen {{ margin: 0; border-radius: 0; }}
+      .player:-webkit-full-screen video {{ width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }}
       .badge {{ position: absolute; top: 10px; font-size: 11px; font-weight: 700; padding: 4px 8px;
         border-radius: 6px; background: rgba(0,0,0,0.55); backdrop-filter: blur(4px); }}
       .badge.quality {{ left: 10px; display: flex; align-items: center; gap: 5px; }}
@@ -3483,6 +3498,7 @@ async def player(token: str):
       .footer {{ text-align: center; padding: 16px; font-size: 12px; color: #6ea8ff; }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
   <body>
     <div class="card">
@@ -3564,11 +3580,30 @@ async def player(token: str):
       let usingProxy = false;
       let currentHls = null;
 
+      // DiskWala serves a progressive MP4/MOV, not HLS, and its CDN sends no
+      // Access-Control-Allow-Origin. A plain <video src> needs no CORS and
+      // streams straight from the CDN (zero Railway egress); hls.js fetches by
+      // XHR, which that CDN blocks. So only hand real .m3u8 manifests to hls.js
+      // -- otherwise every Android client fails AND proxies the file through us.
+      function isHlsUrl(u) {{
+        try {{
+          return /\.m3u8$/i.test(decodeURIComponent(String(u).split('?')[0].split('#')[0]));
+        }} catch (e) {{
+          return /\.m3u8/i.test(String(u));
+        }}
+      }}
+      const sourceIsHls = isHlsUrl(directSrc);
+
       function loadSrc(url, isProxy) {{
         usingProxy = isProxy;
         if (currentHls) {{
           currentHls.destroy();
           currentHls = null;
+        }}
+        if (!sourceIsHls) {{
+          // Progressive file: let the browser stream it natively.
+          video.src = url;
+          return;
         }}
         if (video.canPlayType('application/vnd.apple.mpegurl')) {{
           video.src = url;
@@ -3633,10 +3668,72 @@ async def player(token: str):
       document.getElementById('back10').addEventListener('click', () => {{ video.currentTime = Math.max(0, video.currentTime - 10); }});
       document.getElementById('fwd10').addEventListener('click', () => {{ video.currentTime = Math.min(video.duration || 1e9, video.currentTime + 10); }});
       document.getElementById('muteBtn').addEventListener('click', () => {{ video.muted = !video.muted; }});
-      document.getElementById('fsBtn').addEventListener('click', () => {{
-        const el = document.querySelector('.player');
-        if (document.fullscreenElement) document.exitFullscreen();
-        else if (el.requestFullscreen) el.requestFullscreen();
+      // ===== Fullscreen =====
+      // Telegram's WebView blocks requestFullscreen() on a container element, and
+      // the Mini App itself runs in a partial-height sheet, so the plain
+      // el.requestFullscreen() call this replaced silently did nothing. Try each
+      // mechanism in turn and fall back to a CSS overlay.
+      const playerEl = document.querySelector('.player');
+      const fsBtn = document.getElementById('fsBtn');
+      const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+      let fakeFs = false;
+
+      try {{ if (tg) {{ tg.ready(); tg.expand(); }} }} catch (e) {{}}
+
+      function nativeFsEl() {{
+        return document.fullscreenElement || document.webkitFullscreenElement || null;
+      }}
+      function lockLandscape() {{
+        try {{
+          if (screen.orientation && screen.orientation.lock) {{
+            const p = screen.orientation.lock('landscape');
+            if (p && p.catch) p.catch(() => {{}});
+          }}
+        }} catch (e) {{}}
+      }}
+      function fakeFsOn() {{
+        fakeFs = true;
+        playerEl.classList.add('fake-fs');
+        document.body.classList.add('fs-lock');
+        // Bot API 8.0+: make the Mini App sheet itself cover the screen,
+        // otherwise the overlay only fills the half-height sheet.
+        try {{ if (tg && tg.requestFullscreen) tg.requestFullscreen(); }} catch (e) {{}}
+        lockLandscape();
+      }}
+      function fakeFsOff() {{
+        fakeFs = false;
+        playerEl.classList.remove('fake-fs');
+        document.body.classList.remove('fs-lock');
+        try {{ if (tg && tg.exitFullscreen) tg.exitFullscreen(); }} catch (e) {{}}
+        try {{ if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); }} catch (e) {{}}
+      }}
+      function enterFullscreen() {{
+        if (document.fullscreenEnabled && playerEl.requestFullscreen) {{
+          const p = playerEl.requestFullscreen();
+          if (p && p.catch) p.catch(fakeFsOn); // rejected (common in webviews)
+          lockLandscape();
+          return;
+        }}
+        if (playerEl.webkitRequestFullscreen) {{
+          playerEl.webkitRequestFullscreen();
+          lockLandscape();
+          return;
+        }}
+        // iOS WKWebView allows only the <video> element to enter fullscreen.
+        if (video.webkitEnterFullscreen) {{ video.webkitEnterFullscreen(); return; }}
+        fakeFsOn();
+      }}
+      function exitFullscreen() {{
+        if (fakeFs) {{ fakeFsOff(); return; }}
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      }}
+      fsBtn.addEventListener('click', () => {{
+        if (fakeFs || nativeFsEl()) exitFullscreen();
+        else enterFullscreen();
+      }});
+      document.addEventListener('keydown', (e) => {{
+        if (e.key === 'Escape' && fakeFs) fakeFsOff();
       }});
     </script>
   </body>
