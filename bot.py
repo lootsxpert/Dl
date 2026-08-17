@@ -8,6 +8,7 @@ import json
 import random
 import re
 import string
+import sys
 import time
 import ssl
 from io import BytesIO
@@ -43,6 +44,12 @@ try:
     from motor.motor_asyncio import AsyncIOMotorClient
 except Exception:
     AsyncIOMotorClient = None
+
+# aiohttp's DNS resolver (aiodns) requires a SelectorEventLoop on Windows;
+# without this every aiohttp request raises RuntimeError during local runs.
+# No effect on Linux deployments.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 load_dotenv()
 BOT_BOOT_TIME_UTC = datetime.now(timezone.utc)
@@ -82,10 +89,11 @@ API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DISKWALA_API_KEY = os.getenv("DISKWALA_API_KEY", "").strip()
 DISKWALA_API_BASE = os.getenv("DISKWALA_API_BASE", "http://teradl.kingx.dev:8080").strip().rstrip("/")
-# Primary provider (teraboxdl.site) - HMAC signed requests.
+# Primary provider (teraboxdl.site) - API key header auth.
 TERABOXDL_API_BASE = os.getenv("TERABOXDL_API_BASE", "https://api.teraboxdl.site").strip().rstrip("/")
+# DiskWala links use the diskwala extract route; /v1/api is TeraBox-only.
+TERABOXDL_API_PATH = os.getenv("TERABOXDL_API_PATH", "/api/v1/diskwala/extract").strip()
 TERABOXDL_API_KEY = os.getenv("TERABOXDL_API_KEY", "").strip()
-TERABOXDL_API_SECRET = os.getenv("TERABOXDL_API_SECRET", "").strip()
 SHORTLINK_API = os.getenv('SHORTLINK_API')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
@@ -1696,70 +1704,78 @@ def _normalize_diskwala_filename(data: dict) -> str:
     return name or f"file.{ext}"
 
 
-def _teraboxdl_headers(body: str) -> dict:
-    timestamp = str(int(time.time()))
-    message = f"POST/v1/api{timestamp}{body}"
-    signature = hmac.new(
-        TERABOXDL_API_SECRET.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return {
-        "Content-Type": "application/json",
-        "X-API-Key": TERABOXDL_API_KEY,
-        "X-Timestamp": timestamp,
-        "X-Signature": signature,
-    }
+def _extract_api_error(text: str) -> str:
+    """Pull a human-readable message out of an API error body.
 
-
-async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
-    """Primary provider: api.teraboxdl.site (HMAC-SHA256 signed POST)."""
-    if not (TERABOXDL_API_KEY and TERABOXDL_API_SECRET):
-        return None, "TeraboxDL API credentials are not configured."
-
-    body = json.dumps({"url": url, "dir_path": "", "page": 1}, separators=(",", ":"))
+    Returns "" for HTML bodies (Cloudflare 502/522 pages) so callers fall back
+    to a clean message instead of dumping markup into a Telegram reply.
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    if body[:1] == "<" or body[:9].lower() == "<!doctype":
+        return ""
     try:
-        timeout = aiohttp.ClientTimeout(total=40)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{TERABOXDL_API_BASE}/v1/api",
-                headers=_teraboxdl_headers(body),
-                data=body,
-            ) as resp:
-                if resp.status != 200:
-                    text = (await resp.text())[:200]
-                    _record_api_result("teraboxdl", False, f"HTTP {resp.status} {text}")
-                    return None, f"API error HTTP {resp.status}"
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        _record_api_result("teraboxdl", False, f"{type(e).__name__}: {e}")
-        return None, "Failed to fetch data."
+        payload = json.loads(body)
+    except Exception:
+        return body[:200]
+    if isinstance(payload, dict):
+        for key in ("error", "message", "detail"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:200]
+    return body[:200]
 
-    if not isinstance(data, dict):
-        _record_api_result("teraboxdl", False, "invalid response")
-        return None, "Failed to fetch data."
 
-    if str(data.get("status") or "").lower() not in ("success", "ok", ""):
-        api_msg = data.get("message") or data.get("error") or "API returned an error."
-        _record_api_result("teraboxdl", False, str(api_msg))
-        return None, str(api_msg)
+def _tbx_size_to_bytes(value) -> int:
+    """Size may arrive as bytes (int), a numeric string, or "72.48 MB"."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if s.isdigit():
+            return int(s)
+        return int(_parse_size_string_to_mb(s) * 1024 * 1024)
+    return 0
 
-    info = ((data.get("data") or {}).get("fileInfo")) or {}
-    if not isinstance(info, dict):
-        info = {}
-    direct_url = (info.get("url") or "").strip()
+
+def _tbx_build_name(entry: dict, fallback: str = "file") -> str:
+    name = (entry.get("name") or fallback or "file").strip()
+    ext = (entry.get("extension") or "").strip().lstrip(".")
+    if ext and not name.lower().endswith(f".{ext.lower()}"):
+        return f"{name}.{ext}"
+    return name
+
+
+def _tbx_normalize_entry(entry: dict, parent: dict | None = None) -> dict | None:
+    """Map one API file object to the bot's internal result shape.
+
+    Handles all three observed layouts: docs single-video (top-level url/
+    download_url/stream_url), the live fileInfo object, and playlist files[].
+    """
+    parent = parent or {}
+    direct_url = (
+        entry.get("download_url") or entry.get("url")
+        or parent.get("download_url") or parent.get("url") or ""
+    ).strip()
     if not direct_url:
-        api_msg = data.get("message") or data.get("error") or "No direct url in response."
-        _record_api_result("teraboxdl", False, str(api_msg))
-        return None, str(api_msg)
+        return None
 
-    size_bytes = int(info.get("size") or 0)
-    full_name = _normalize_diskwala_filename(info)
-    thumbnail = (info.get("thumb") or info.get("thumbnail") or "").strip()
-    media_type = (info.get("type") or "").lower()
-    stream = direct_url if media_type.startswith("video") else ""
+    full_name = _tbx_build_name(entry, fallback=parent.get("name") or "file")
+    size_bytes = _tbx_size_to_bytes(
+        entry.get("bytes") or entry.get("size") or parent.get("size") or 0
+    )
+    thumbnail = (
+        entry.get("thumbnail") or entry.get("thumb")
+        or parent.get("thumbnail") or parent.get("thumb") or ""
+    ).strip()
 
-    _record_api_result("teraboxdl", True)
+    stream = (entry.get("stream_url") or parent.get("stream_url") or "").strip()
+    if not stream:
+        media_type = (entry.get("type") or parent.get("type") or "").lower()
+        if media_type.startswith("video") or full_name.lower().endswith((".mp4", ".mkv", ".webm", ".m3u8")):
+            stream = direct_url
+
     return {
         "name": full_name,
         "size_mb": round(size_bytes / 1024 / 1024, 2),
@@ -1767,8 +1783,89 @@ async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
         "stream": stream,
         "thumbnail": thumbnail,
         "source": "teraboxdl",
-        "credits_remaining": data.get("credits_remaining"),
-    }, ""
+    }
+
+
+def _tbx_parse_payload(data: dict) -> tuple[dict | None, int]:
+    """Return (first playable file, total files found)."""
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return None, 0
+
+    files = payload.get("files")
+    if isinstance(files, list) and files:
+        entries = [f for f in files if isinstance(f, dict)]
+        for entry in entries:
+            result = _tbx_normalize_entry(entry, parent=payload)
+            if result:
+                return result, len(entries)
+        return None, len(entries)
+
+    info = payload.get("fileInfo")
+    if isinstance(info, dict):
+        result = _tbx_normalize_entry(info, parent=payload)
+        if result:
+            return result, 1
+
+    result = _tbx_normalize_entry(payload)
+    return result, (1 if result else 0)
+
+
+async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
+    """Primary provider: api.teraboxdl.site DiskWala extract route.
+
+    Auth is the API key header only. Note /v1/api is the TeraBox route and
+    rejects DiskWala links with "Invalid TeraBox URL".
+    """
+    if not TERABOXDL_API_KEY:
+        return None, "TeraboxDL API key is not configured."
+
+    body = json.dumps({"url": url}, separators=(",", ":"))
+    # Ask for gzip only: the API serves brotli by default and some aiohttp/brotli
+    # builds fail to decode it ("Can not decode content-encoding: br").
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": TERABOXDL_API_KEY,
+        "Accept-Encoding": "gzip, deflate",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=40)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{TERABOXDL_API_BASE}{TERABOXDL_API_PATH}",
+                headers=headers,
+                data=body,
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    api_msg = _extract_api_error(text) or f"HTTP {resp.status}"
+                    _record_api_result("teraboxdl", False, f"HTTP {resp.status} {text[:200]}")
+                    return None, str(api_msg)
+                data = json.loads(text)
+    except Exception as e:
+        _record_api_result("teraboxdl", False, f"{type(e).__name__}: {e}")
+        return None, f"Failed to fetch data ({type(e).__name__})."
+
+    if not isinstance(data, dict):
+        _record_api_result("teraboxdl", False, "invalid response")
+        return None, "Failed to fetch data."
+
+    if str(data.get("status") or "").lower() not in ("success", "ok", ""):
+        api_msg = _extract_api_error(text) or "API returned an error."
+        _record_api_result("teraboxdl", False, str(api_msg))
+        return None, str(api_msg)
+
+    result, total_files = _tbx_parse_payload(data)
+    if not result:
+        api_msg = _extract_api_error(text) or "No direct url in response."
+        _record_api_result("teraboxdl", False, str(api_msg))
+        return None, str(api_msg)
+
+    result["credits_remaining"] = data.get("credits_remaining")
+    result["total_files"] = total_files
+
+    _record_api_result("teraboxdl", True)
+    return result, ""
 
 
 async def fetch_diskwala_link(url: str) -> tuple[dict | None, str]:
