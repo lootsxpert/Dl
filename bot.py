@@ -111,6 +111,10 @@ def _split_env_list(raw: str) -> list[str]:
 # fall back to a link derived from the channel itself.
 FORCE_SUB_CHANNELS = _split_env_list(FORCE_SUB_CHANNEL)
 FORCE_SUB_INVITE_URLS = _split_env_list(os.getenv("FORCE_SUB_INVITE_URL", ""))
+# How long a pending join request counts as verified. 0 = until the bot
+# restarts. Telegram sends no update when a request is cancelled or declined,
+# so a TTL is the only way to expire access short of a restart.
+FORCE_SUB_REQUEST_TTL_SECONDS = int(float(os.getenv("FORCE_SUB_REQUEST_TTL_HOURS", "0")) * 3600)
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "").strip()
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
@@ -163,6 +167,11 @@ stream_tokens: dict[str, dict] = {}
 # file_token -> pending Get File request metadata
 file_tokens: dict[str, dict] = {}
 payment_tokens: dict[str, dict] = {}
+# user_id -> {chat_id: requested_at_ts} for pending force-sub join requests.
+# Telegram lets bots see a join request only as a live update, never as a
+# query, so this is the sole record that a user asked to join. Not persisted:
+# a restart clears it and still-pending users must cancel and request again.
+_join_requests: dict[int, dict[int, float]] = {}
 
 mongo_client = None
 mongo_db = None
@@ -227,6 +236,13 @@ def _cleanup_expired_tokens() -> None:
         payment_tokens.pop(t, None)
     for t in [k for k, v in file_tokens.items() if v.get("expires_at", 0) <= now]:
         file_tokens.pop(t, None)
+    if FORCE_SUB_REQUEST_TTL_SECONDS > 0:
+        for uid in list(_join_requests):
+            chats = _join_requests[uid]
+            for cid in [c for c, ts in chats.items() if (now - ts) > FORCE_SUB_REQUEST_TTL_SECONDS]:
+                chats.pop(cid, None)
+            if not chats:
+                _join_requests.pop(uid, None)
 
 
 def _utc_now() -> datetime:
@@ -987,6 +1003,50 @@ def _is_valid_https_url(u: str) -> bool:
         return False
 
 
+def _record_join_request(user_id: int, chat_id: int) -> None:
+    """Remember that a user asked to join a chat (no approval implied)."""
+    _join_requests.setdefault(int(user_id), {})[int(chat_id)] = _now_ts()
+
+
+def _has_join_request(user_id: int, chat_id: int) -> bool:
+    """Whether a still-valid join request is on record for this user + chat."""
+    ts = (_join_requests.get(int(user_id)) or {}).get(int(chat_id))
+    if ts is None:
+        return False
+    if FORCE_SUB_REQUEST_TTL_SECONDS <= 0:
+        return True
+    return (_now_ts() - ts) <= FORCE_SUB_REQUEST_TTL_SECONDS
+
+
+_force_sub_id_cache: dict[str, int] = {}
+
+
+async def _force_sub_chat_id(client: Client, target: dict) -> int | None:
+    """Numeric chat id for a target, so it can be matched against join requests.
+
+    Join-request updates always carry a numeric id, but FORCE_SUB_CHANNEL may
+    name the channel by @username, so resolve and cache the mapping.
+    """
+    ref = target.get("ref")
+    if ref is None:
+        return None
+    if isinstance(ref, int):
+        return ref
+    raw = target["raw"]
+    cached = _force_sub_id_cache.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        chat = await client.get_chat(ref)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+    except Exception:
+        return None
+    if chat_id:
+        _force_sub_id_cache[raw] = chat_id
+        return chat_id
+    return None
+
+
 async def _is_subscribed_to(client: Client, user_id: int, target: dict) -> bool:
     """Membership check for one channel. Bot must be admin there to read members."""
     chat_ref = target.get("ref")
@@ -997,14 +1057,24 @@ async def _is_subscribed_to(client: Client, user_id: int, target: dict) -> bool:
         m = await client.get_chat_member(chat_ref, user_id)
         # In channels, user may appear as RESTRICTED but still "joined".
         # Treat anything except LEFT/BANNED as subscribed.
-        return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        if m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+            return True
+        if m.status == ChatMemberStatus.BANNED:
+            # Banned users must never regain access through a stale join request.
+            return False
     except UserNotParticipant:
-        return False
+        pass
     except ChatAdminRequired:
         # If bot isn't admin, treat as not subscribed to force correct setup.
         return False
     except Exception:
         return False
+
+    # Not a member: a pending join request still counts as verified. Telegram
+    # gives bots no way to query pending requests, so this relies on having
+    # seen the live ChatJoinRequest update (see force_sub_join_request).
+    chat_id = await _force_sub_chat_id(client, target)
+    return bool(chat_id) and _has_join_request(user_id, chat_id)
 
 
 async def _missing_force_sub(client: Client, user_id: int) -> list[dict]:
@@ -2756,6 +2826,23 @@ async def broadcast_cancel_cb(client, callback_query):
         return await callback_query.answer("This broadcast is already finished.", show_alert=True)
     job["cancel"].set()
     await callback_query.answer("Cancelling broadcast…", show_alert=False)
+
+
+@app.on_chat_join_request()
+async def force_sub_join_request(client, join_request):
+    """Record join requests so a pending user still passes the force-sub gate.
+
+    Bots cannot query pending requests, so this live update is the only chance
+    to learn about one. The request is left pending; nothing is approved here.
+    """
+    try:
+        user = getattr(join_request, "from_user", None)
+        chat = getattr(join_request, "chat", None)
+        if user is None or chat is None:
+            return
+        _record_join_request(user.id, chat.id)
+    except Exception as e:
+        await report_error(client, "force_sub_join_request", e)
 
 
 @app.on_callback_query(filters.regex(r"^check_join$"))
