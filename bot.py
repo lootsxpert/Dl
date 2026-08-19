@@ -98,7 +98,19 @@ SHORTLINK_API = os.getenv('SHORTLINK_API')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 PUBLIC_BASE_URL = PUBLIC_BASE_URL.strip().strip('"').strip("'").rstrip("/")  # e.g. https://your-domain.com
-FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")  # your updates channel
+FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")  # your updates channel(s), comma separated
+
+
+def _split_env_list(raw: str) -> list[str]:
+    """Parse a comma (or newline) separated env value into a clean list."""
+    return [part.strip() for part in (raw or "").replace("\n", ",").split(",") if part.strip()]
+
+
+# Force-sub accepts any number of channels. FORCE_SUB_INVITE_URL is matched by
+# position, so the Nth invite link belongs to the Nth channel; entries left out
+# fall back to a link derived from the channel itself.
+FORCE_SUB_CHANNELS = _split_env_list(FORCE_SUB_CHANNEL)
+FORCE_SUB_INVITE_URLS = _split_env_list(os.getenv("FORCE_SUB_INVITE_URL", ""))
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "").strip()
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
@@ -387,8 +399,8 @@ def _format_user_name(user_obj=None, fallback: str = "") -> str:
     return fallback or "Unknown"
 
 
-def _force_sub_join_url() -> str:
-    raw = (FORCE_SUB_CHANNEL or "").strip()
+def _force_sub_join_url_for(raw: str) -> str:
+    raw = (raw or "").strip()
     if not raw:
         return ""
     if raw.startswith(("http://", "https://")):
@@ -400,8 +412,8 @@ def _force_sub_join_url() -> str:
     return f"https://t.me/{raw}"
 
 
-def _force_sub_chat_ref() -> str | int | None:
-    raw = (FORCE_SUB_CHANNEL or "").strip()
+def _force_sub_chat_ref_for(raw: str) -> str | int | None:
+    raw = (raw or "").strip()
     if not raw:
         return None
     if raw.startswith("-100") and raw[1:].isdigit():
@@ -419,6 +431,21 @@ def _force_sub_chat_ref() -> str | int | None:
     if raw.startswith("+"):
         return None
     return f"@{raw}"
+
+
+def _force_sub_targets() -> list[dict]:
+    """One entry per configured channel: the chat ref used for the membership
+    check, plus the invite URL its button should point at."""
+    targets: list[dict] = []
+    for idx, raw in enumerate(FORCE_SUB_CHANNELS):
+        invite = FORCE_SUB_INVITE_URLS[idx] if idx < len(FORCE_SUB_INVITE_URLS) else ""
+        targets.append({
+            "index": idx,
+            "raw": raw,
+            "ref": _force_sub_chat_ref_for(raw),
+            "url": invite or _force_sub_join_url_for(raw),
+        })
+    return targets
 
 
 async def _notify_admin(client: Client, text: str) -> None:
@@ -960,24 +987,11 @@ def _is_valid_https_url(u: str) -> bool:
         return False
 
 
-async def _is_subscribed(client: Client, user_id: int) -> bool:
-    """
-    Returns True if user is a member/admin/owner of FORCE_SUB_CHANNEL.
-    Note: bot must be admin in the channel to read members reliably.
-    """
-    global _force_sub_warned
-    chat_ref = _force_sub_chat_ref()
+async def _is_subscribed_to(client: Client, user_id: int, target: dict) -> bool:
+    """Membership check for one channel. Bot must be admin there to read members."""
+    chat_ref = target.get("ref")
     if chat_ref is None:
-        if FORCE_SUB_CHANNEL and not _force_sub_warned:
-            _force_sub_warned = True
-            await _notify_admin(
-                client,
-                (
-                    "⚠️ Force-sub check is disabled because `FORCE_SUB_CHANNEL` "
-                    "is an invite link. Set channel @username or numeric chat id "
-                    "for membership verification."
-                ),
-            )
+        # Invite-only link: membership cannot be verified, so don't block on it.
         return True
     try:
         m = await client.get_chat_member(chat_ref, user_id)
@@ -993,29 +1007,135 @@ async def _is_subscribed(client: Client, user_id: int) -> bool:
         return False
 
 
-def _join_markup() -> InlineKeyboardMarkup:
-    join_url = os.getenv("FORCE_SUB_INVITE_URL", "") or _force_sub_join_url()
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Updates Channel", url=join_url)],
-        [InlineKeyboardButton("✅ Check Joined", callback_data="check_join")],
-    ])
+async def _missing_force_sub(client: Client, user_id: int) -> list[dict]:
+    """Channels this user still has to join. Empty list means access is allowed."""
+    global _force_sub_warned
+    targets = _force_sub_targets()
+    if not targets:
+        return []
+
+    unverifiable = [t for t in targets if t.get("ref") is None]
+    if unverifiable and not _force_sub_warned:
+        _force_sub_warned = True
+        names = ", ".join(t["raw"] for t in unverifiable)
+        await _notify_admin(
+            client,
+            (
+                "⚠️ Force-sub check is skipped for these entries because they are "
+                f"invite links: {names}\n\nSet a channel @username or numeric chat id "
+                "for membership verification."
+            ),
+        )
+
+    checks = await asyncio.gather(
+        *[_is_subscribed_to(client, user_id, t) for t in targets],
+        return_exceptions=True,
+    )
+    return [t for t, ok in zip(targets, checks) if ok is not True]
+
+
+async def _is_subscribed(client: Client, user_id: int) -> bool:
+    """True only when the user has joined every configured channel."""
+    return not await _missing_force_sub(client, user_id)
+
+
+_force_sub_title_cache: dict[str, str] = {}
+
+
+async def _force_sub_label(client: Client, target: dict) -> str:
+    """Readable channel name for the button; falls back to @name / 'Channel N'."""
+    raw = target["raw"]
+    cached = _force_sub_title_cache.get(raw)
+    if cached:
+        return cached
+    title = ""
+    if target.get("ref") is not None:
+        try:
+            chat = await client.get_chat(target["ref"])
+            title = (getattr(chat, "title", "") or "").strip()
+        except Exception:
+            title = ""
+    if not title:
+        title = raw if raw.startswith("@") else f"Channel {target['index'] + 1}"
+    _force_sub_title_cache[raw] = title
+    return title
+
+
+_force_sub_url_cache: dict[str, str] = {}
+
+
+async def _force_sub_url(client: Client, target: dict) -> str:
+    """Button URL for a channel.
+
+    Falls back to asking Telegram for an invite link, so a channel configured by
+    numeric id with no matching FORCE_SUB_INVITE_URL entry still gets a button
+    instead of blocking the user with nothing to tap. Requires the bot to be
+    admin there with invite rights.
+    """
+    url = (target.get("url") or "").strip()
+    if _is_valid_http_url(url):
+        return url
+    raw = target["raw"]
+    cached = _force_sub_url_cache.get(raw)
+    if cached:
+        return cached
+    ref = target.get("ref")
+    if ref is None:
+        return ""
+    link = ""
+    try:
+        chat = await client.get_chat(ref)
+        link = (getattr(chat, "invite_link", "") or "").strip()
+        if not link and getattr(chat, "username", None):
+            link = f"https://t.me/{chat.username}"
+    except Exception:
+        link = ""
+    if not link:
+        try:
+            link = (await client.export_chat_invite_link(ref) or "").strip()
+        except Exception:
+            link = ""
+    if link:
+        _force_sub_url_cache[raw] = link
+    return link
+
+
+async def _join_markup(client: Client, targets: list[dict] | None = None) -> InlineKeyboardMarkup:
+    """One join button per channel, then the shared verify button."""
+    if targets is None:
+        targets = _force_sub_targets()
+    rows = []
+    for t in targets:
+        url = await _force_sub_url(client, t)
+        if not _is_valid_http_url(url):
+            continue
+        label = await _force_sub_label(client, t)
+        rows.append([InlineKeyboardButton(f"📢 Join {label}", url=url)])
+    rows.append([InlineKeyboardButton("✅ Check Joined", callback_data="check_join")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _ensure_joined(client: Client, message) -> bool:
     """
-    Ensures user joined FORCE_SUB_CHANNEL. If not, prompts and returns False.
+    Ensures the user joined every FORCE_SUB_CHANNEL entry. If not, prompts
+    with a button per pending channel and returns False.
     """
     try:
         user_id = message.from_user.id
     except Exception:
         return False
 
-    if await _is_subscribed(client, user_id):
+    missing = await _missing_force_sub(client, user_id)
+    if not missing:
         return True
 
+    if len(missing) == 1:
+        intro = "To use this bot, please join our updates channel."
+    else:
+        intro = f"To use this bot, please join all {len(missing)} channels below."
     await message.reply(
-        f"To use this bot, please join our updates channel.\n\nAfter joining, tap **Check Joined**.",
-        reply_markup=_join_markup()
+        f"{intro}\n\nAfter joining, tap **Check Joined**.",
+        reply_markup=await _join_markup(client, missing),
     )
     return False
 
@@ -2641,31 +2761,33 @@ async def broadcast_cancel_cb(client, callback_query):
 @app.on_callback_query(filters.regex(r"^check_join$"))
 async def check_join_cb(client, callback_query):
     user_id = callback_query.from_user.id
-    chat_ref = _force_sub_chat_ref()
-    if chat_ref is None:
-        await callback_query.answer("Join link is configured as invite; skipping verification.", show_alert=True)
+    if not _force_sub_targets():
+        await callback_query.answer("No channel is configured; skipping verification.", show_alert=True)
         return
-    try:
-        m = await client.get_chat_member(chat_ref, user_id)
-        is_joined = m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
-    except ChatAdminRequired:
-        await callback_query.answer(
-            f"Bot is not admin in {FORCE_SUB_CHANNEL}. Ask admin to add bot as admin, then try again.",
-            show_alert=True,
-        )
-        return
-    except Exception:
-        is_joined = False
 
-    if is_joined:
+    missing = await _missing_force_sub(client, user_id)
+
+    if not missing:
         try:
             await callback_query.message.edit_text("✅ Verified! Now send your DiskWala link.")
         except ChatWriteForbidden:
             pass
+        except Exception:
+            pass
         await callback_query.answer("Verified ✅", show_alert=False)
         return
 
-    await callback_query.answer("Not joined yet. Please join the channel first.", show_alert=True)
+    # Still pending: keep only the channels they haven't joined yet.
+    names = ", ".join([await _force_sub_label(client, t) for t in missing])
+    try:
+        await callback_query.message.edit_reply_markup(await _join_markup(client, missing))
+    except Exception:
+        pass
+    if len(missing) == 1:
+        alert = f"Not joined yet. Please join {names} first."
+    else:
+        alert = f"Still {len(missing)} channels left to join: {names}"
+    await callback_query.answer(alert, show_alert=True)
 
 
 @app.on_callback_query(filters.regex(r"^buyplan:([a-zA-Z0-9_]+)$"))
