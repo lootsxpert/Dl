@@ -184,10 +184,20 @@ _broadcast_jobs: dict[str, dict] = {}
 # transfer job_id -> {"cancel": asyncio.Event, "user_id": int}
 _file_transfer_jobs: dict[str, dict] = {}
 
-# In-memory admin toggles (not persisted; reset on restart)
-QUOTA_ENABLED = True  # /shortlink_on|off - when False, free users must buy premium after free quota
-FREE_MODE_ENABLED = False  # /freemode_on|off - when True, bot is free for everyone
-SENDFILE_ENABLED = True  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env var, falling back to `default` when unset/blank."""
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "enabled")
+
+
+# Admin toggles. Changed at runtime by the /shortlink_*, /freemode_* and
+# /sendfile_* commands, but those changes are in-memory only and are lost on
+# every restart or deploy, so the startup state comes from these env vars.
+QUOTA_ENABLED = _env_flag("QUOTA_ENABLED", False)  # /shortlink_on|off - when False, free users must buy premium after free quota
+FREE_MODE_ENABLED = _env_flag("FREE_MODE_ENABLED", False)  # /freemode_on|off - when True, bot is free for everyone
+SENDFILE_ENABLED = _env_flag("SENDFILE_ENABLED", False)  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
 
 # In-memory per-API usage/health counters (not persisted; reset on restart).
 # api_key -> {attempts, success, fail, consecutive_fails, last_ok_at, last_fail_at, last_error}
