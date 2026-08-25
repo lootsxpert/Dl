@@ -1987,8 +1987,23 @@ def _tbx_normalize_entry(entry: dict, parent: dict | None = None) -> dict | None
 
 
 def _tbx_parse_payload(data: dict) -> tuple[dict | None, int]:
-    """Return (first playable file, total files found)."""
+    """Return (first playable file, total files found).
+
+    data may be a dict (fileInfo / playlist / single-video shapes) or a plain
+    list of file objects, e.g. the cached single-video response where data is
+    `[{_id, name, type, thumb, url, download_url, stream_url, ...}]`.
+    """
     payload = data.get("data")
+
+    if isinstance(payload, list):
+        entries = [f for f in payload if isinstance(f, dict)]
+        for entry in entries:
+            # Each list element is a self-contained file object.
+            result = _tbx_normalize_entry(entry)
+            if result:
+                return result, len(entries)
+        return None, len(entries)
+
     if not isinstance(payload, dict):
         return None, 0
 
