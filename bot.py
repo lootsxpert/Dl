@@ -122,7 +122,7 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
 PREMIUM_PLANS = {
-    "day": {"label": "1 Day", "amount_inr": 5, "days": 1, "stars": 10},
+    # "day": {"label": "1 Day", "amount_inr": 5, "days": 1, "stars": 10},
     "week": {"label": "1 Week", "amount_inr": 30, "days": 7, "stars": 60},
     "month": {"label": "1 Month", "amount_inr": 100, "days": 30, "stars": 200},
     "quarter": {"label": "3 Months", "amount_inr": 250, "days": 90, "stars": 500},
