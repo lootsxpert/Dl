@@ -2026,6 +2026,12 @@ def _tbx_parse_payload(data: dict) -> tuple[dict | None, int]:
     return result, (1 if result else 0)
 
 
+# Prefix on error strings signalling a transient upstream rate limit, so
+# callers can tell the user to retry later (and refund the reserved credit)
+# instead of treating it as a hard failure / falling to the dead fallback.
+_RATE_LIMIT_MARKER = "RATE_LIMITED|"
+
+
 async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
     """Primary provider: api.teraboxdl.site DiskWala extract route.
 
@@ -2043,23 +2049,51 @@ async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
         "X-API-Key": TERABOXDL_API_KEY,
         "Accept-Encoding": "gzip, deflate",
     }
-    try:
-        timeout = aiohttp.ClientTimeout(total=40)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{TERABOXDL_API_BASE}{TERABOXDL_API_PATH}",
-                headers=headers,
-                data=body,
-            ) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    api_msg = _extract_api_error(text) or f"HTTP {resp.status}"
+    # The API's own upstream (diskwala.com) rate-limits under concurrent load
+    # and returns {"error":"Upstream HTTP 429"}. Retry briefly with backoff.
+    # If it is still rate-limited after retries, the error is marked with
+    # _RATE_LIMIT_MARKER so the caller can tell the user to retry later (and
+    # refund the reserved credit) instead of falling through to a fallback.
+    last_err = ""
+    rate_limited = False
+    for attempt in range(3):
+        try:
+            timeout = aiohttp.ClientTimeout(total=40)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{TERABOXDL_API_BASE}{TERABOXDL_API_PATH}",
+                    headers=headers,
+                    data=body,
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status == 200:
+                        data = json.loads(text)
+                        break
+                    last_err = _extract_api_error(text) or f"HTTP {resp.status}"
+                    rate_limited = (resp.status == 429) or ("429" in last_err)
+                    if rate_limited and attempt < 2:
+                        await asyncio.sleep(2 * (attempt + 1))
+                        continue
+                    if not rate_limited and resp.status in (500, 502, 503, 504) and attempt < 2:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
                     _record_api_result("teraboxdl", False, f"HTTP {resp.status} {text[:200]}")
-                    return None, str(api_msg)
-                data = json.loads(text)
-    except Exception as e:
-        _record_api_result("teraboxdl", False, f"{type(e).__name__}: {e}")
-        return None, f"Failed to fetch data ({type(e).__name__})."
+                    if rate_limited:
+                        return None, f"{_RATE_LIMIT_MARKER}{last_err}"
+                    return None, str(last_err)
+        except Exception as e:
+            last_err = f"Failed to fetch data ({type(e).__name__})."
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            _record_api_result("teraboxdl", False, f"{type(e).__name__}: {e}")
+            return None, last_err
+    else:
+        # All retries exhausted without a 200 response.
+        _record_api_result("teraboxdl", False, last_err or "no 200 after retries")
+        if rate_limited:
+            return None, f"{_RATE_LIMIT_MARKER}{last_err or 'Upstream rate limit.'}"
+        return None, last_err or "Failed to fetch data."
 
     if not isinstance(data, dict):
         _record_api_result("teraboxdl", False, "invalid response")
@@ -2084,11 +2118,18 @@ async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
 
 
 async def fetch_diskwala_link(url: str) -> tuple[dict | None, str]:
-    """Try primary (teraboxdl), fall back to DiskWala/kingx on failure."""
+    """Try primary (teraboxdl), fall back to DiskWala/kingx on failure.
+
+    A rate limit on the primary is transient and the fallback is dead, so a
+    rate-limited response is returned as-is (marked) instead of being sent to
+    the fallback, which would only add a misleading 522.
+    """
     result, err = await fetch_teraboxdl_link(url)
     if result:
         return result, ""
     primary_err = err
+    if primary_err.startswith(_RATE_LIMIT_MARKER):
+        return None, primary_err
 
     result, err = await _fetch_kingx_link(url)
     if result:
@@ -2708,10 +2749,19 @@ async def diskwala(client, message):
             result, err_msg = await fetch_diskwala_link(url)
 
             if not result:
-                await msg.edit(
-                    f"Failed ❌\n\n{err_msg}",
-                    reply_markup=_support_markup(),
-                )
+                if err_msg.startswith(_RATE_LIMIT_MARKER):
+                    await msg.edit(
+                        "⚠️ **High traffic right now.**\n\n"
+                        "Too many users are trying to fetch the same file at once. "
+                        "Please wait a couple of minutes and try again.\n\n"
+                        "Your download credit has been refunded.",
+                        reply_markup=_support_markup(),
+                    )
+                else:
+                    await msg.edit(
+                        f"Failed ❌\n\n{err_msg}",
+                        reply_markup=_support_markup(),
+                    )
                 # refund reserved credit because request didn't succeed
                 if not skip_quota:
                     await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
