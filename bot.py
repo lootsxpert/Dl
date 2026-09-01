@@ -1530,6 +1530,31 @@ def _schedule_delete_payment_post_in(client: Client, chat_id: int, message_id: i
     asyncio.create_task(_runner())
 
 
+async def _delete_payment_post_now(client: Client, pay_ref: str) -> None:
+    """Delete the QR/I-have-paid message immediately after a successful
+    premium grant. Reads chat_id/message_id from the session doc so any
+    apply site (webhook, manual check, stars) can call it."""
+    if not pay_ref or payments_col is None:
+        return
+    try:
+        doc = await payments_col.find_one(
+            {"pay_ref": pay_ref},
+            {"post_chat_id": 1, "post_message_id": 1},
+        )
+    except Exception:
+        return
+    if not doc:
+        return
+    chat_id = doc.get("post_chat_id")
+    message_id = doc.get("post_message_id")
+    if not chat_id or not message_id:
+        return
+    try:
+        await client.delete_messages(int(chat_id), int(message_id))
+    except Exception:
+        pass
+
+
 def _schedule_disable_and_mark_expired(client: Client, chat_id: int, message_id: int, *, is_caption: bool) -> None:
     async def _runner():
         await asyncio.sleep(AUTO_DELETE_SECONDS)
@@ -3680,6 +3705,14 @@ async def pay_method_cb(client, callback_query):
                 disable_web_page_preview=True,
             )
         if payment_post:
+            if payments_col is not None:
+                await payments_col.update_one(
+                    {"pay_ref": pay_ref},
+                    {"$set": {
+                        "post_chat_id": payment_post.chat.id,
+                        "post_message_id": payment_post.id,
+                    }},
+                )
             _schedule_delete_payment_post_in(
                 client,
                 payment_post.chat.id,
@@ -3820,6 +3853,7 @@ async def check_pay_cb(client, callback_query):
                 await _close_payment_session(pay_ref)
                 await callback_query.message.reply(result_text)
                 if was_new:
+                    await _delete_payment_post_now(client, pay_ref)
                     await _notify_purchase(client, user_id, plan_key, payment_id=payment_id, source="manual_check")
             else:
                 await _close_payment_session(pay_ref)
@@ -4149,6 +4183,8 @@ async def razorpay_webhook():
         result_text, was_new = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
         if pay_ref:
             await _close_payment_session(pay_ref)
+        if was_new:
+            await _delete_payment_post_now(app, pay_ref or "")
         if payments_col is not None:
             record_key = pay_ref or (f"qr:{qr_code_id}" if qr_code_id else "") or (
                         payment_id or f"plink:{payment_link_id}")
