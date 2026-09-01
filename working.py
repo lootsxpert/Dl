@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, unquote_plus, urljoin, urlparse
 
 from pyrogram import Client, filters, raw, utils
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, LinkPreviewOptions
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from pyrogram.errors import (
     UserNotParticipant,
     ChatAdminRequired,
@@ -28,7 +28,7 @@ from pyrogram.errors import (
     MessageNotModified,
     WebpageMediaEmpty,
 )
-from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram.enums import ChatMemberStatus
 import aiohttp
 import os
 from dotenv import load_dotenv
@@ -57,6 +57,7 @@ BOT_BOOT_TIME_UTC = datetime.now(timezone.utc)
 # Telegram allows bots to upload up to 2 GB; override via TELEGRAM_MAX_UPLOAD_MB if needed.
 TELEGRAM_MAX_UPLOAD_MB = float(os.getenv("TELEGRAM_MAX_UPLOAD_MB", "2048"))
 LIMIT_FREE_REQUESTS = 3
+UNLOCK_TOKEN_TTL_SECONDS = 60 * 60  # 1 hour to use the unlock token
 STREAM_TOKEN_TTL_SECONDS = 15 * 60  # 15 minutes
 MAX_LINKS_PER_MESSAGE = 3
 UNLOCK_PROMPT_COOLDOWN_SECONDS = 90
@@ -93,13 +94,10 @@ TERABOXDL_API_BASE = os.getenv("TERABOXDL_API_BASE", "https://api.teraboxdl.site
 # DiskWala links use the diskwala extract route; /v1/api is TeraBox-only.
 TERABOXDL_API_PATH = os.getenv("TERABOXDL_API_PATH", "/api/v1/diskwala/extract").strip()
 TERABOXDL_API_KEY = os.getenv("TERABOXDL_API_KEY", "").strip()
+SHORTLINK_API = os.getenv('SHORTLINK_API')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
-PUBLIC_BASE_URL = PUBLIC_BASE_URL.strip().strip('"').strip("'").rstrip("/")  # Render/Railway URL for /player web app
-CF_WORKER_URL = os.getenv("CF_WORKER_URL", "").strip().strip('"').strip("'").rstrip("/")
-WORKER_SECRET = os.getenv("WORKER_SECRET", "").strip()
-# Cloudflare Worker base — free egress for file sends + HLS (NOT the same as PUBLIC_BASE_URL)
-_CF_HLS_BASE = CF_WORKER_URL
+PUBLIC_BASE_URL = PUBLIC_BASE_URL.strip().strip('"').strip("'").rstrip("/")  # e.g. https://your-domain.com
 FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")  # your updates channel(s), comma separated
 
 
@@ -169,8 +167,6 @@ stream_tokens: dict[str, dict] = {}
 # file_token -> pending Get File request metadata
 file_tokens: dict[str, dict] = {}
 payment_tokens: dict[str, dict] = {}
-# referral_confirm_token -> {"referrer_id": int, "referee_id": int, "created_at": float}
-referral_pending: dict[str, dict] = {}
 # user_id -> {chat_id: requested_at_ts} for pending force-sub join requests.
 # Telegram lets bots see a join request only as a live update, never as a
 # query, so this is the sole record that a user asked to join. Not persisted:
@@ -181,7 +177,6 @@ mongo_client = None
 mongo_db = None
 users_col = None
 payments_col = None
-referrals_col = None
 premium_reminder_task = None
 _force_sub_warned = False
 # broadcast job_id -> {"cancel": asyncio.Event, "admin_id": int}
@@ -197,9 +192,10 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on", "enabled")
 
 
-# Admin toggles. Changed at runtime by the /freemode_* and
+# Admin toggles. Changed at runtime by the /shortlink_*, /freemode_* and
 # /sendfile_* commands, but those changes are in-memory only and are lost on
 # every restart or deploy, so the startup state comes from these env vars.
+QUOTA_ENABLED = _env_flag("QUOTA_ENABLED", False)  # /shortlink_on|off - when False, free users must buy premium after free quota
 FREE_MODE_ENABLED = _env_flag("FREE_MODE_ENABLED", False)  # /freemode_on|off - when True, bot is free for everyone
 SENDFILE_ENABLED = _env_flag("SENDFILE_ENABLED", False)  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
 
@@ -321,7 +317,6 @@ async def _upsert_user_profile(user, bot_key: str) -> None:
             },
             "$setOnInsert": {
                 "created_at": now,
-                "first_seen": now,
             },
             "$addToSet": {"bot_keys": bot_key},
         },
@@ -403,64 +398,6 @@ async def _apply_quota_addon(user_id: int, plan_key: str) -> int:
                 upsert=True,
             )
     return quota_add
-
-
-# ===== REFERRAL =====
-# Every successful referral credits the referrer with bonus credit.
-# Bonus quota is permanent (does not reset daily) and is consumed before
-# the daily remaining counter, so it extends the user's effective limit
-# beyond the daily cap until used up.
-REFERRAL_BONUS_QUOTA = 25   # Bonus credit awarded per batch
-REFERRAL_BONUS_EVERY_N = 5   # Award bonus every N confirmed referrals (5 = each batch of 5)
-
-
-async def _get_bonus_quota(user_id: int) -> int:
-    if users_col is None:
-        return 0
-    doc = await users_col.find_one({"user_id": int(user_id)}, {"bonus_quota": 1})
-    return int((doc or {}).get("bonus_quota") or 0)
-
-
-async def _add_bonus_quota(user_id: int, n: int) -> int:
-    """Add `n` permanent bonus credit to a user. Returns new total."""
-    if n <= 0 or users_col is None:
-        return await _get_bonus_quota(user_id)
-    res = await users_col.find_one_and_update(
-        {"user_id": int(user_id)},
-        {"$inc": {"bonus_quota": int(n)}, "$set": {"updated_at": _utc_now()}},
-        upsert=True,
-        return_document=True,  # ReturnDocument.AFTER equivalent in motor
-    )
-    return int((res or {}).get("bonus_quota") or 0)
-
-
-async def _get_referral_count(user_id: int) -> int:
-    """Count of *confirmed* referrals made by this user."""
-    if referrals_col is None:
-        return 0
-    return int(await referrals_col.count_documents({
-        "referrer_id": int(user_id),
-        "confirmed": True,
-    }))
-
-
-async def _get_user_display_name(client, user_id: int) -> str:
-    try:
-        u = await client.get_users(int(user_id))
-        if u.username:
-            return f"@{u.username}"
-        if u.first_name:
-            return u.first_name
-    except Exception:
-        pass
-    return f"user {user_id}"
-
-
-async def _referral_link(client, user_id: int) -> str:
-    """Build a t.me deep link that the new user taps to start with the
-    ref_<userid> payload."""
-    me = await client.get_me()
-    return f"https://t.me/{me.username}?start=ref_{user_id}"
 
 
 async def _apply_purchase(user_id: int, plan_key: str, payment_id: str = "") -> str:
@@ -594,7 +531,7 @@ async def _notify_purchase(client: Client, user_id: int, plan_key: str, payment_
                 f"Username: {user_uname or 'N/A'}\n"
                 f"User ID: `{int(user_id)}`\n"
                 f"Plan: {plan.get('label', plan_key)}\n"
-                f"Amount: ₹{plan.get('amount_inr', 'N/A')} / ⭐{plan.get('stars', 'N/A')}\n"
+                f"Amount: ₹{plan.get('amount_inr', 'N/A')} / ⭐️{plan.get('stars', 'N/A')}\n"
                 f"Payment ID: {payment_id or 'N/A'}\n"
                 f"Source: {source or 'unknown'}"
             ),
@@ -636,96 +573,36 @@ def _api_status_text() -> str:
     return "\n".join(lines)
 
 
-async def _referral_stats_text(bot_key: str) -> str:
-    """Total confirmed referrals + top referrer (name + count)."""
-    if referrals_col is None:
-        return ""
-    try:
-        total = int(await referrals_col.count_documents({"confirmed": True}))
-    except Exception:
-        return ""
-
-    top_line = "Top referrer: —"
-    try:
-        pipeline = [
-            {"$match": {"confirmed": True}},
-            {"$group": {"_id": "$referrer_id", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-            {"$limit": 1},
-        ]
-        top = None
-        async for doc in referrals_col.aggregate(pipeline):
-            top = doc
-            break
-        if top and int(top.get("count", 0)) > 0:
-            rid = int(top["_id"])
-            count = int(top["count"])
-            name = await _get_user_display_name_local(rid)
-            top_line = f"Top referrer: {name} ({count})"
-    except Exception:
-        pass
-
-    return (
-        "🤝 Referrals\n"
-        f"Total confirmed: {total}\n"
-        f"{top_line}"
-    )
-
-
-async def _get_user_display_name_local(user_id: int) -> str:
-    """Username/first-name lookup that works without a pyrogram Client."""
-    if users_col is not None:
-        try:
-            doc = await users_col.find_one(
-                {"user_id": int(user_id)},
-                {"username": 1, "first_name": 1, "last_name": 1},
-            )
-            if doc:
-                if doc.get("username"):
-                    return f"@{doc['username']}"
-                first = (doc.get("first_name") or "").strip()
-                last = (doc.get("last_name") or "").strip()
-                full = (f"{first} {last}").strip()
-                if full:
-                    return full
-        except Exception:
-            pass
-    return f"user {user_id}"
-
-
 async def _status_text(bot_key: str) -> str:
     api_text = _api_status_text()
-    referral_text = await _referral_stats_text(bot_key)
     if users_col is None:
         total_users = len(user_data)
-        body = (
+        return (
             "📊 Bot Status\n\n"
             f"Total users: {total_users}\n"
             "Premium users: DB not enabled\n"
             f"In-memory users today: {total_users}\n\n"
-            f"Toggles: freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+            f"Toggles: quota={'on' if QUOTA_ENABLED else 'off'} | "
+            f"freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
             f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
             f"{api_text}"
         )
-    else:
-        now = _utc_now()
-        total_users = await users_col.count_documents({"bot_keys": bot_key})
-        premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$gt": now}})
-        expired_premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$lte": now}})
-        active_today = await users_col.count_documents({f"bots.{bot_key}.last_seen_at": {"$gte": now - timedelta(days=1)}})
-        body = (
-            "📊 Bot Status\n\n"
-            f"Total users: {total_users}\n"
-            f"Premium active users: {premium_users}\n"
-            f"Premium expired users: {expired_premium_users}\n"
-            f"Active users (last 24h): {active_today}\n\n"
-            f"Toggles: freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
-            f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
-            f"{api_text}"
-        )
-    if referral_text:
-        body += f"\n\n{referral_text}"
-    return body
+    now = _utc_now()
+    total_users = await users_col.count_documents({"bot_keys": bot_key})
+    premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$gt": now}})
+    expired_premium_users = await users_col.count_documents({"bot_keys": bot_key, "premium_until": {"$lte": now}})
+    active_today = await users_col.count_documents({f"bots.{bot_key}.last_seen_at": {"$gte": now - timedelta(days=1)}})
+    return (
+        "📊 Bot Status\n\n"
+        f"Total users: {total_users}\n"
+        f"Premium active users: {premium_users}\n"
+        f"Premium expired users: {expired_premium_users}\n"
+        f"Active users (last 24h): {active_today}\n\n"
+        f"Toggles: quota={'on' if QUOTA_ENABLED else 'off'} | "
+        f"freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
+        f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
+        f"{api_text}"
+    )
 
 
 async def _razorpay_auth_header() -> dict:
@@ -1381,22 +1258,23 @@ def _file_caption(name: str, size_mb: float) -> str:
     )
 
 
-def _file_options_caption(
-    name: str,
-    size_mb: float,
-    *,
-    has_stream: bool = False,
-    is_premium: bool = False,
-) -> str:
+def _file_options_caption(name: str, size_mb: float, *, has_stream: bool = False) -> str:
     size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
     lines = [
         f"📁 {name}",
         size_line,
+        "",
+        "Choose an option:",
     ]
+    if has_stream and PUBLIC_BASE_URL:
+        lines.append("▶️ Watch Now (Free) — stream in web app")
+    else:
+        lines.append("▶️ Watch Now (Free) — unavailable for this file")
+    lines.append("📥 Get File (Premium) — sent here (auto-deleted in 45 min)")
     if size_mb > TELEGRAM_MAX_UPLOAD_MB:
         lines.append(
             f"\n⚠️ File exceeds Telegram upload limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). "
-            "Use Watch Online if Get File fails."
+            "Use Watch Now if Get File fails."
         )
     return "\n".join(lines)
 
@@ -1408,10 +1286,8 @@ def _build_file_options_markup(
     name: str,
     size_mb: float,
     download_url: str,
-    is_premium: bool,
 ) -> InlineKeyboardMarkup | None:
     rows = []
-    # Watch Online — always shown, free for everyone.
     if stream and PUBLIC_BASE_URL:
         stoken = create_stream_token(
             stream, name=name, size_mb=size_mb, download_url=download_url or "", quality="480p",
@@ -1419,23 +1295,12 @@ def _build_file_options_markup(
         web_app_url = f"{PUBLIC_BASE_URL}/player/{stoken}"
         if _is_valid_https_url(web_app_url):
             rows.append([InlineKeyboardButton(
-                "▶️ Watch Online",
+                "▶️ Watch Now (Free)",
                 web_app=WebAppInfo(url=web_app_url),
             )])
-    # Download — shown to everyone. Free users tap → popup "Premium only";
-    # premium users tap → bot calls _send_file_free (≤50MB direct CDN, >50MB
-    # falls back to local download+upload).
-    if _is_valid_http_url(download_url) or _is_valid_http_url(stream):
+    if _is_valid_http_url(download_url):
         rows.append([InlineKeyboardButton(
-            "⬇️ Download",
-            callback_data=f"dlfile:{file_token}",
-        )])
-    # Get File — only when admin ran /sendfile_on. Same path as Download but
-    # separate button so the admin can toggle the heavy file-send path
-    # without redeploying.
-    if SENDFILE_ENABLED and _is_valid_http_url(download_url):
-        rows.append([InlineKeyboardButton(
-            "📥 Get File",
+            "📥 Get File (Premium)",
             callback_data=f"gfile:{file_token}",
         )])
     return InlineKeyboardMarkup(rows) if rows else None
@@ -1562,24 +1427,11 @@ async def reserve_credit(user_id: int) -> tuple[bool, bool, int]:
     """
     Atomically reserve 1 credit for this user.
     If API fails later, call refund_reserved_credit().
-
-    Bonus quota (permanent, e.g. from referrals) is consumed first, then
-    the daily remaining counter. So a user with 50 bonus + 0 daily gets
-    50 more downloads on top of tomorrow's daily reset.
     """
     is_premium = await _is_premium_user(user_id)
     daily_limit = PREMIUM_DAILY_DOWNLOADS if is_premium else LIMIT_FREE_REQUESTS
     lock = _get_user_lock(user_id)
     async with lock:
-        # Consume bonus quota first if any exists.
-        if users_col is not None:
-            bonus = await _get_bonus_quota(user_id)
-            if bonus > 0:
-                await users_col.update_one(
-                    {"user_id": int(user_id)},
-                    {"$inc": {"bonus_quota": -1}, "$set": {"updated_at": _utc_now()}},
-                )
-                return True, is_premium, daily_limit
         state = await _get_quota_state(user_id, daily_limit=daily_limit)
         if int(state.get("remaining", 0)) <= 0:
             return False, is_premium, daily_limit
@@ -1599,14 +1451,6 @@ async def reserve_credit(user_id: int) -> tuple[bool, bool, int]:
 async def refund_reserved_credit(user_id: int, daily_limit: int, n: int = 1) -> None:
     lock = _get_user_lock(user_id)
     async with lock:
-        # Refund back to bonus first if we know it was the source, otherwise
-        # to the daily counter.
-        if users_col is not None:
-            await users_col.update_one(
-                {"user_id": int(user_id)},
-                {"$inc": {"bonus_quota": int(n)}, "$set": {"updated_at": _utc_now()}},
-            )
-            return
         state = await _get_quota_state(user_id, daily_limit=daily_limit)
         new_remaining = int(state.get("remaining", 0)) + int(n)
         if users_col is None:
@@ -1795,6 +1639,36 @@ async def _broadcast_edit_status(client: Client, chat_id: int, message_id: int, 
         pass
 
 
+async def send_unlock_once(client: Client, message, user_id: int) -> bool:
+    """
+    Sends the unlock prompt at most once per cooldown window per user.
+    Returns True if a prompt was sent, False if suppressed (already sent recently).
+    """
+    lock = _get_user_lock(user_id)
+    async with lock:
+        now = _now_ts()
+        user = user_data.get(user_id) or {}
+        last_ts = float(user.get("last_unlock_prompt_ts") or 0)
+        if now - last_ts < UNLOCK_PROMPT_COOLDOWN_SECONDS:
+            return False
+        user["last_unlock_prompt_ts"] = now
+        user_data[user_id] = user
+
+    shortlink = await generate_shortlink(user_id, client=client)
+    premium_url = _bot_start_url(client, "premium")
+    await message.reply(
+        f"❌ Your Current Limit reached.\n\nWatch below ad to get next {LIMIT_FREE_REQUESTS} downloads:"
+        f"Apple Users: Copy Ad Link, open in browser, and fully close Telegram."
+        "\n\nOr you can buy premium to get unlimited downloads.😉",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔓 Unlock Access| Watch Ad", url=shortlink)],
+            [InlineKeyboardButton("❓ How to Unlock", url="https://t.me/howdisk/3")],
+            [InlineKeyboardButton("💎 Buy Premium", url=premium_url)]
+        ])
+    )
+    return True
+
+
 async def send_premium_required_once(client: Client, message, user_id: int) -> bool:
     """
     Sends the premium prompt at most once per cooldown window per user.
@@ -1813,9 +1687,18 @@ async def send_premium_required_once(client: Client, message, user_id: int) -> b
     premium_url = _bot_start_url(client, "premium")
     await message.reply(
         f"Your {LIMIT_FREE_REQUESTS} free downloads are over for today.\n\n"
-        "Please buy premium membership to continue downloading.",
+        "Ad unlock is currently disabled. Please buy premium membership to continue downloading.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Buy Premium", url=premium_url)],
+            [InlineKeyboardButton("Contact Admin", url=f"https://t.me/{ADMIN_CONTACT_BOT}")],
+        ])
+    )
+    return True
+    await message.reply(
+        f"âŒ Your {LIMIT_FREE_REQUESTS} free downloads are over for today.\n\n"
+        "Ad unlock is currently disabled. Please buy premium membership to continue downloading.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("ðŸ’Ž Buy Premium", url=premium_url)],
             [InlineKeyboardButton("Contact Admin", url=f"https://t.me/{ADMIN_CONTACT_BOT}")],
         ])
     )
@@ -1841,96 +1724,168 @@ async def _reply_invalid_link_once(client: Client, message, user_id: int) -> boo
     return True
 
 
-@app.on_message(filters.command("refer"))
-async def refer_cmd(client, message):
-    """Show user's referral link, stats, and a Share button."""
-    user_id = int(message.from_user.id)
+async def report_error(client: Client, where: str, err: Exception, extra: dict | None = None) -> None:
     try:
-        link = await _referral_link(client, user_id)
-        count = await _get_referral_count(user_id)
-        bonus = await _get_bonus_quota(user_id)
+        user_line = ""
+        extra = extra or {}
+        user_id = extra.get("user_id")
+        if user_id:
+            user_name = "Unknown"
+            user_uname = ""
+            try:
+                u = await client.get_users(int(user_id))
+                user_name = _format_user_name(u)
+                if getattr(u, "username", None):
+                    user_uname = f"@{u.username}"
+            except Exception:
+                user_doc = await users_col.find_one({"user_id": int(user_id)}, {"first_name": 1, "last_name": 1,
+                                                                                "username": 1}) if users_col else None
+                if user_doc:
+                    first = (user_doc.get("first_name") or "").strip()
+                    last = (user_doc.get("last_name") or "").strip()
+                    user_name = (f"{first} {last}").strip() or "Unknown"
+                    if user_doc.get("username"):
+                        user_uname = f"@{str(user_doc.get('username')).strip()}"
+            user_line = f"\nUser: {user_name} {user_uname}".rstrip()
+        extra_txt = ""
+        if extra:
+            extra_txt = "\n\nExtra:\n" + "\n".join([f"- {k}: {str(v)[:800]}" for k, v in extra.items()])
+        await _notify_admin(
+            client,
+            f"❗️Bot error in `{where}`{user_line}\n\n{type(err).__name__}: {err}{extra_txt}",
+        )
     except Exception:
-        link = ""
-        count = 0
-        bonus = 0
-
-    if not link:
-        return await message.reply("❌ Could not build your referral link. Try again later.")
-
-    share_text = quote_plus(
-        "Join me on this bot — fast DiskWala downloads. Use my link:"
-    )
-    share_url = f"https://t.me/share/url?url={quote_plus(link)}&text={share_text}"
-
-    await message.reply(
-        f"🤝 <b>Refer &amp; Earn</b>\n\n"
-        f"<b>Your link:</b>\n{link}\n\n"
-        f"Every <b>new user</b> who joins via your link and confirms adds 1 to your tally. "
-        f"For every {REFERRAL_BONUS_EVERY_N} confirmed referrals, you get "
-        f"<b>+{REFERRAL_BONUS_QUOTA} bonus credit</b> (lump sum, after the "
-        f"{REFERRAL_BONUS_EVERY_N}th confirm). "
-        f"Bonus credit never expire.\n\n"
-        f"💡 <b>Examples:</b>\n"
-        f"  • {REFERRAL_BONUS_EVERY_N} Refer = {REFERRAL_BONUS_QUOTA} credit\n"
-        f"  • {REFERRAL_BONUS_EVERY_N * 2} Refer = {REFERRAL_BONUS_QUOTA * 2} credit\n"
-        f"  • {REFERRAL_BONUS_EVERY_N * 10} Refer = {REFERRAL_BONUS_QUOTA * 10} credit\n\n"
-        f"📊 <b>Your stats</b>\n"
-        f"  • Confirmed referrals: <b>{count}</b>\n"
-        f"  • Bonus credit banked: <b>{bonus}</b>",
-        parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 Share Link", url=share_url)],
-        ]),
-    )
+        return
 
 
-# ============================================================
-# Merged-in sections from working.py (single-file bot, like TeraDl/main.py)
-# ============================================================
+async def generate_shortlink(user_id, client: Client | None = None):
+    _cleanup_expired_tokens()
+    token = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
 
-# --- Missing constants (UNLOCK_TOKEN_TTL_SECONDS, SHORTLINK_API, QUOTA_ENABLED, FILE_TOKEN_TTL_SECONDS) ---
-UNLOCK_TOKEN_TTL_SECONDS = 60 * 60  # 1 hour to use the unlock token
-SHORTLINK_API = os.getenv('SHORTLINK_API')
-QUOTA_ENABLED = _env_flag("QUOTA_ENABLED", False)  # /shortlink_on|off
+    tokens[token] = {
+        "user_id": user_id,
+        "used": False,
+        "expires_at": _now_ts() + UNLOCK_TOKEN_TTL_SECONDS,
+    }
+
+    destination = _bot_start_url(client, token)
+
+    url = f"https://nanolinks.in/api?api={SHORTLINK_API}&url={destination}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            data = await resp.json()
+
+    return data.get("shortenedUrl")
+
+
+def create_stream_token(stream_url: str, name: str = "", size_mb: float = 0.0,
+                         download_url: str = "", quality: str = "") -> str:
+    _cleanup_expired_tokens()
+    token = ''.join(random.choices(string.ascii_letters + string.digits, k=24))
+    stream_tokens[token] = {
+        "url": stream_url,
+        "name": name,
+        "size_mb": size_mb,
+        "download_url": download_url,
+        "quality": quality,
+        "expires_at": _now_ts() + STREAM_TOKEN_TTL_SECONDS,
+    }
+    return token
+
+
 FILE_TOKEN_TTL_SECONDS = 30 * 60  # 30 minutes to choose Get File
 
-# Cloudflare Worker path B (used by _send_file_free below).
-_BOT_API_SEND_DOC_LIMIT_MB = 50.0  # Telegram Bot API URL-send limit
 
-# Prefix on error strings signalling a transient upstream rate limit, so
-# callers can tell the user to retry later (and refund the reserved credit)
-# instead of treating it as a hard failure / falling to the dead fallback.
-_RATE_LIMIT_MARKER = "RATE_LIMITED|"
-
-_HLS_FORWARD_RESPONSE_HEADERS = ("Content-Range", "Accept-Ranges")
-
-
-# --- aiohttp threaded connector (used by _send_file_free) ---
-def _threaded_connector():
-    """Force aiohttp to use a real threaded DNS resolver.
-
-    Without this, aiohttp uses the asyncio event loop's getaddrinfo, which
-    on Linux defaults to a single-threaded blocking resolver and stalls
-    the whole loop on slow DNS.
-    """
-    try:
-        import aiodns  # noqa: F401
-        from aiohttp.resolver import AsyncResolver
-        return aiohttp.TCPConnector(resolver=AsyncResolver(), ttl_dns_cache=300)
-    except Exception:
-        return aiohttp.TCPConnector(ttl_dns_cache=300)
+def create_file_token(
+    link: str,
+    name: str,
+    size_mb: float,
+    stream: str,
+    user_id: int,
+) -> str:
+    _cleanup_expired_tokens()
+    token = "".join(random.choices(string.ascii_letters + string.digits, k=16))
+    file_tokens[token] = {
+        "link": link,
+        "name": name,
+        "size_mb": size_mb,
+        "stream": stream,
+        "user_id": int(user_id),
+        "expires_at": _now_ts() + FILE_TOKEN_TTL_SECONDS,
+    }
+    return token
 
 
-# --- API helpers (size parsing, normalization, error extraction) ---
-def _human_size(n):
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.2f}{unit}"
-        n /= 1024
-    return f"{n:.2f}TB"
+def _transfer_progress_text(
+    *,
+    name: str,
+    size_mb: float,
+    phase: str,
+    current: int,
+    total: int,
+    speed_bps: float,
+    elapsed: float,
+    cancelled: bool = False,
+    finished: bool = False,
+    error: str = "",
+) -> str:
+    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
+    lines = [f"📁 {name}", size_line, ""]
+
+    if cancelled and finished:
+        lines.append("⏹ Transfer cancelled.")
+    elif error:
+        lines.append(f"❌ {error}")
+    elif finished:
+        lines.append("✅ File sent. It will be deleted in 45 minutes.")
+    else:
+        lines.append(f"⏳ {phase}...")
+        if total > 0:
+            pct = min(100.0, (current / total) * 100)
+            lines.append(f"Progress: {_human_size(current)} / {_human_size(total)} ({pct:.1f}%)")
+        elif current > 0:
+            lines.append(f"Transferred: {_human_size(current)}")
+        if speed_bps > 0:
+            lines.append(f"Speed: {_human_size(speed_bps)}/s")
+        if total > 0 and current > 0 and current < total and speed_bps > 0:
+            eta = (total - current) / speed_bps
+            lines.append(f"ETA: ~{_format_duration(eta)}")
+        lines.append(f"Elapsed: {_format_duration(elapsed)}")
+
+    return "\n".join(lines)
 
 
+class TransferCancelled(Exception):
+    pass
+
+
+async def download_file_with_progress(
+    url: str,
+    path: str,
+    *,
+    cancel_event: asyncio.Event,
+    total_bytes: int = 0,
+    on_progress=None,
+) -> None:
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            if not total_bytes:
+                total_bytes = int(resp.headers.get("Content-Length", 0) or 0)
+            downloaded = 0
+            with open(path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    if cancel_event.is_set():
+                        raise TransferCancelled()
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if on_progress:
+                        await on_progress(downloaded, total_bytes)
+
+
+# ===== API CALL =====
 def _parse_size_string_to_mb(size_str: str) -> float:
     m = re.match(r'\s*([\d.]+)\s*([KMGT]?B)', size_str or "", re.I)
     if not m:
@@ -1972,40 +1927,6 @@ def _extract_api_error(text: str) -> str:
     return body[:200]
 
 
-# --- /usage display helpers ---
-def _format_usage_value(key, value):
-    key_lower = key.lower()
-    if any(part in key_lower for part in ("key", "token", "secret", "password")):
-        return "***"
-    if isinstance(value, (int, float)) and any(
-        part in key_lower for part in ("size", "bytes", "bandwidth", "traffic", "storage")
-    ):
-        return _human_size(value)
-    return str(value)
-
-
-def _format_api_usage(data: dict) -> str:
-    if not data:
-        return "Usage info is empty."
-
-    lines = ["Usage:"]
-
-    def add_items(items, prefix=""):
-        for key, value in items.items():
-            label = f"{prefix}{str(key).replace('_', ' ').title()}"
-            if isinstance(value, dict):
-                lines.append(f"{label}:")
-                add_items(value, prefix="  ")
-            elif isinstance(value, list):
-                lines.append(f"{label}: {', '.join(map(str, value)) if value else 'None'}")
-            else:
-                lines.append(f"{label}: {_format_usage_value(str(key), value)}")
-
-    add_items(data)
-    return "\n".join(lines)
-
-
-# --- API responses (teraboxdl primary, kingx fallback) ---
 def _tbx_size_to_bytes(value) -> int:
     """Size may arrive as bytes (int), a numeric string, or "72.48 MB"."""
     if isinstance(value, (int, float)):
@@ -2077,6 +1998,7 @@ def _tbx_parse_payload(data: dict) -> tuple[dict | None, int]:
     if isinstance(payload, list):
         entries = [f for f in payload if isinstance(f, dict)]
         for entry in entries:
+            # Each list element is a self-contained file object.
             result = _tbx_normalize_entry(entry)
             if result:
                 return result, len(entries)
@@ -2104,6 +2026,12 @@ def _tbx_parse_payload(data: dict) -> tuple[dict | None, int]:
     return result, (1 if result else 0)
 
 
+# Prefix on error strings signalling a transient upstream rate limit, so
+# callers can tell the user to retry later (and refund the reserved credit)
+# instead of treating it as a hard failure / falling to the dead fallback.
+_RATE_LIMIT_MARKER = "RATE_LIMITED|"
+
+
 async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
     """Primary provider: api.teraboxdl.site DiskWala extract route.
 
@@ -2114,11 +2042,18 @@ async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
         return None, "TeraboxDL API key is not configured."
 
     body = json.dumps({"url": url}, separators=(",", ":"))
+    # Ask for gzip only: the API serves brotli by default and some aiohttp/brotli
+    # builds fail to decode it ("Can not decode content-encoding: br").
     headers = {
         "Content-Type": "application/json",
         "X-API-Key": TERABOXDL_API_KEY,
         "Accept-Encoding": "gzip, deflate",
     }
+    # The API's own upstream (diskwala.com) rate-limits under concurrent load
+    # and returns {"error":"Upstream HTTP 429"}. Retry briefly with backoff.
+    # If it is still rate-limited after retries, the error is marked with
+    # _RATE_LIMIT_MARKER so the caller can tell the user to retry later (and
+    # refund the reserved credit) instead of falling through to a fallback.
     last_err = ""
     rate_limited = False
     for attempt in range(3):
@@ -2154,6 +2089,7 @@ async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
             _record_api_result("teraboxdl", False, f"{type(e).__name__}: {e}")
             return None, last_err
     else:
+        # All retries exhausted without a 200 response.
         _record_api_result("teraboxdl", False, last_err or "no 200 after retries")
         if rate_limited:
             return None, f"{_RATE_LIMIT_MARKER}{last_err or 'Upstream rate limit.'}"
@@ -2179,6 +2115,31 @@ async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
 
     _record_api_result("teraboxdl", True)
     return result, ""
+
+
+async def fetch_diskwala_link(url: str) -> tuple[dict | None, str]:
+    """Try primary (teraboxdl), fall back to DiskWala/kingx on failure.
+
+    A rate limit on the primary is transient and the fallback is dead, so a
+    rate-limited response is returned as-is (marked) instead of being sent to
+    the fallback, which would only add a misleading 522.
+    """
+    result, err = await fetch_teraboxdl_link(url)
+    if result:
+        return result, ""
+    primary_err = err
+    if primary_err.startswith(_RATE_LIMIT_MARKER):
+        return None, primary_err
+
+    result, err = await _fetch_kingx_link(url)
+    if result:
+        return result, ""
+    logger.warning("Both APIs failed. primary=%s fallback=%s", primary_err, err)
+    # Surface the primary provider's error. The legacy kingx fallback is dead
+    # and its "HTTP 522" tells the user (and us) nothing about the real cause.
+    if primary_err and err:
+        return None, f"{primary_err} (fallback: {err})"
+    return None, primary_err or err
 
 
 async def _fetch_kingx_link(url: str) -> tuple[dict | None, str]:
@@ -2227,300 +2188,7 @@ async def _fetch_kingx_link(url: str) -> tuple[dict | None, str]:
     }, ""
 
 
-async def fetch_diskwala_link(url: str) -> tuple[dict | None, str]:
-    """Try primary (teraboxdl), fall back to DiskWala/kingx on failure.
-
-    A rate limit on the primary is transient and the fallback is dead, so a
-    rate-limited response is returned as-is (marked) instead of being sent to
-    the fallback, which would only add a misleading 522.
-    """
-    result, err = await fetch_teraboxdl_link(url)
-    if result:
-        return result, ""
-    primary_err = err
-    if primary_err.startswith(_RATE_LIMIT_MARKER):
-        return None, primary_err
-
-    result, err = await _fetch_kingx_link(url)
-    if result:
-        return result, ""
-    logger.warning("Both APIs failed. primary=%s fallback=%s", primary_err, err)
-    if primary_err and err:
-        return None, f"{primary_err} (fallback: {err})"
-    return None, primary_err or err
-
-
-# --- Error reporter (moved up from working.py) ---
-async def report_error(client: Client, where: str, err: Exception, extra: dict | None = None) -> None:
-    try:
-        user_line = ""
-        extra = extra or {}
-        user_id = extra.get("user_id")
-        if user_id:
-            user_name = "Unknown"
-            user_uname = ""
-            try:
-                u = await client.get_users(int(user_id))
-                user_name = _format_user_name(u)
-                if getattr(u, "username", None):
-                    user_uname = f"@{u.username}"
-            except Exception:
-                user_doc = await users_col.find_one({"user_id": int(user_id)}, {"first_name": 1, "last_name": 1,
-                                                                                "username": 1}) if users_col else None
-                if user_doc:
-                    first = (user_doc.get("first_name") or "").strip()
-                    last = (user_doc.get("last_name") or "").strip()
-                    user_name = (f"{first} {last}").strip() or "Unknown"
-                    if user_doc.get("username"):
-                        user_uname = f"@{str(user_doc.get('username')).strip()}"
-            user_line = f"\nUser: {user_name} {user_uname}".rstrip()
-        extra_txt = ""
-        if extra:
-            extra_txt = "\n\nExtra:\n" + "\n".join([f"- {k}: {str(v)[:800]}" for k, v in extra.items()])
-        await _notify_admin(
-            client,
-            f"❗️Bot error in `{where}`{user_line}\n\n{type(err).__name__}: {err}{extra_txt}",
-        )
-    except Exception:
-        return
-
-
-# --- Shortlink / unlock flow ---
-async def send_unlock_once(client: Client, message, user_id: int) -> bool:
-    """
-    Sends the unlock prompt at most once per cooldown window per user.
-    Returns True if a prompt was sent, False if suppressed (already sent recently).
-    """
-    lock = _get_user_lock(user_id)
-    async with lock:
-        now = _now_ts()
-        user = user_data.get(user_id) or {}
-        last_ts = float(user.get("last_unlock_prompt_ts") or 0)
-        if now - last_ts < UNLOCK_PROMPT_COOLDOWN_SECONDS:
-            return False
-        user["last_unlock_prompt_ts"] = now
-        user_data[user_id] = user
-
-    shortlink = await generate_shortlink(user_id, client=client)
-    premium_url = _bot_start_url(client, "premium")
-    await message.reply(
-        f"❌ Your Current Limit reached.\n\nWatch below ad to get next {LIMIT_FREE_REQUESTS} downloads:"
-        f"Apple Users: Copy Ad Link, open in browser, and fully close Telegram."
-        "\n\nOr you can buy premium to get unlimited downloads.😉",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔓 Unlock Access| Watch Ad", url=shortlink)],
-            [InlineKeyboardButton("❓ How to Unlock", url="https://t.me/howdisk/3")],
-            [InlineKeyboardButton("💎 Buy Premium", url=premium_url)]
-        ])
-    )
-    return True
-
-
-async def generate_shortlink(user_id, client: Client | None = None):
-    _cleanup_expired_tokens()
-    token = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-
-    tokens[token] = {
-        "user_id": user_id,
-        "used": False,
-        "expires_at": _now_ts() + UNLOCK_TOKEN_TTL_SECONDS,
-    }
-
-    destination = _bot_start_url(client, token)
-
-    url = f"https://nanolinks.in/api?api={SHORTLINK_API}&url={destination}"
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
-
-    return data.get("shortenedUrl")
-
-
-# --- File/stream tokens ---
-def create_stream_token(stream_url: str, name: str = "", size_mb: float = 0.0,
-                         download_url: str = "", quality: str = "") -> str:
-    _cleanup_expired_tokens()
-    token = ''.join(random.choices(string.ascii_letters + string.digits, k=24))
-    stream_tokens[token] = {
-        "url": stream_url,
-        "name": name,
-        "size_mb": size_mb,
-        "download_url": download_url,
-        "quality": quality,
-        "expires_at": _now_ts() + STREAM_TOKEN_TTL_SECONDS,
-    }
-    return token
-
-
-def create_file_token(
-    link: str,
-    name: str,
-    size_mb: float,
-    stream: str,
-    user_id: int,
-) -> str:
-    _cleanup_expired_tokens()
-    token = "".join(random.choices(string.ascii_letters + string.digits, k=16))
-    file_tokens[token] = {
-        "link": link,
-        "name": name,
-        "size_mb": size_mb,
-        "stream": stream,
-        "user_id": int(user_id),
-        "expires_at": _now_ts() + FILE_TOKEN_TTL_SECONDS,
-    }
-    return token
-
-
-# --- Get File transfer: progress text + cancel + downloader + runner ---
-def _transfer_progress_text(
-    *,
-    name: str,
-    size_mb: float,
-    phase: str,
-    current: int,
-    total: int,
-    speed_bps: float,
-    elapsed: float,
-    cancelled: bool = False,
-    finished: bool = False,
-    error: str = "",
-) -> str:
-    size_line = f"📦 {size_mb} MB" if size_mb and size_mb > 0 else "📦 Size unknown"
-    lines = [f"📁 {name}", size_line, ""]
-
-    if cancelled and finished:
-        lines.append("⏹ Transfer cancelled.")
-    elif error:
-        lines.append(f"❌ {error}")
-    elif finished:
-        lines.append("✅ File sent. It will be deleted in 45 minutes.")
-    else:
-        lines.append(f"⏳ {phase}...")
-        if total > 0:
-            pct = min(100.0, (current / total) * 100)
-            lines.append(f"Progress: {_human_size(current)} / {_human_size(total)} ({pct:.1f}%)")
-        elif current > 0:
-            lines.append(f"Transferred: {_human_size(current)}")
-        if speed_bps > 0:
-            lines.append(f"Speed: {_human_size(speed_bps)}/s")
-        if total > 0 and current > 0 and current < total and speed_bps > 0:
-            eta = (total - current) / speed_bps
-            lines.append(f"ETA: ~{_format_duration(eta)}")
-        lines.append(f"Elapsed: {_format_duration(elapsed)}")
-
-    return "\n".join(lines)
-
-
-class TransferCancelled(Exception):
-    pass
-
-
-async def download_file_with_progress(
-    url: str,
-    path: str,
-    *,
-    cancel_event: asyncio.Event,
-    total_bytes: int = 0,
-    on_progress=None,
-) -> None:
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            if not total_bytes:
-                total_bytes = int(resp.headers.get("Content-Length", 0) or 0)
-            downloaded = 0
-            with open(path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 1024):
-                    if cancel_event.is_set():
-                        raise TransferCancelled()
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if on_progress:
-                        await on_progress(downloaded, total_bytes)
-
-
-async def _send_file_free(
-    chat_id: int,
-    cdn_url: str,
-    name: str,
-    size_mb: float,
-    caption: str = "",
-) -> int | None:
-    """Send a file via Cloudflare Worker — zero bytes through this server.
-
-    Returns Telegram message_id on success, None if unavailable/failed
-    (caller should fall back to the normal Pyrogram download→upload path).
-    """
-    if not _CF_HLS_BASE:
-        return None
-
-    safe_name = re.sub(r'[<>:"/\\|?*]', "_", name) or "file.bin"
-
-    # Path A: ≤ 50 MB — Telegram pulls from CF Worker /dl URL
-    if size_mb <= _BOT_API_SEND_DOC_LIMIT_MB:
-        cf_url = f"{_CF_HLS_BASE}/dl?u={quote_plus(cdn_url)}&n={quote_plus(safe_name)}"
-        payload = {
-            "chat_id": chat_id,
-            "document": cf_url,
-            "caption": caption,
-            "parse_mode": "HTML",
-        }
-        try:
-            async with aiohttp.ClientSession(connector=_threaded_connector()) as session:
-                async with session.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=180),
-                ) as resp:
-                    data = await resp.json()
-                    if data.get("ok"):
-                        return data["result"]["message_id"]
-                    logger.warning("Bot API sendDocument failed: %s", data.get("description", "unknown"))
-                    return None
-        except Exception as exc:
-            logger.warning("_send_file_free (url) error: %s", exc)
-            return None
-
-    # Path B: > 50 MB — CF Worker streams CDN → Telegram via /upload
-    if not WORKER_SECRET:
-        return None
-
-    upload_payload = {
-        "chat_id": chat_id,
-        "cdn_url": cdn_url,
-        "name": safe_name,
-        "caption": caption,
-        "bot_token": BOT_TOKEN,
-    }
-    headers = {"x-worker-secret": WORKER_SECRET, "content-type": "application/json"}
-    try:
-        async with aiohttp.ClientSession(connector=_threaded_connector()) as session:
-            async with session.post(
-                f"{_CF_HLS_BASE}/upload",
-                json=upload_payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                if resp.status == 404:
-                    logger.info("CF Worker /upload route missing (404); using slow path")
-                    return None
-                if resp.status >= 400:
-                    body = (await resp.text())[:200]
-                    logger.warning("CF Worker /upload HTTP %s: %s", resp.status, body)
-                    return None
-                data = await resp.json()
-                if data.get("ok"):
-                    return data["result"]["message_id"]
-                logger.warning("CF Worker /upload failed: %s", data.get("description") or data.get("error"))
-                return None
-    except Exception as exc:
-        logger.warning("_send_file_free (upload) error: %s", exc)
-        return None
-
-
+# ===== DOWNLOAD =====
 async def _run_get_file_transfer(
     client: Client,
     *,
@@ -2530,7 +2198,6 @@ async def _run_get_file_transfer(
     link: str,
     name: str,
     size_mb: float,
-    source_url: str = "",
 ) -> None:
     cancel_event = _file_transfer_jobs[job_id]["cancel"]
     cancel_markup = InlineKeyboardMarkup([
@@ -2587,35 +2254,6 @@ async def _run_get_file_transfer(
 
     try:
         await _refresh(force=True)
-
-        # Fast path: Cloudflare Worker sends the file for FREE
-        if size_mb <= _BOT_API_SEND_DOC_LIMIT_MB:
-            phase = "Sending via CDN (no bandwidth used here)"
-            await _refresh(force=True)
-
-            async def _heartbeat():
-                while True:
-                    await asyncio.sleep(8)
-                    await _refresh()
-
-            heartbeat_task = asyncio.create_task(_heartbeat())
-            try:
-                cdn_url = link
-                msg_id = await _send_file_free(
-                    chat_id=chat_id,
-                    cdn_url=cdn_url,
-                    name=name,
-                    size_mb=size_mb,
-                    caption=_file_caption(name, size_mb),
-                )
-            finally:
-                heartbeat_task.cancel()
-            if msg_id is not None:
-                _schedule_delete_message(client, chat_id, msg_id)
-                await _refresh(force=True, finished=True)
-                return  # Done — no local download/upload needed
-
-        # Slow path: download to disk → upload via Pyrogram (MTProto)
         await download_file_with_progress(
             link,
             path,
@@ -2663,7 +2301,6 @@ async def _run_get_file_transfer(
                 pass
 
 
-# --- Premium menu (refactor of the inline premium plan picker) ---
 async def send_premium_menu(message, user_id: int):
     if not _is_premium_enabled():
         return await message.reply(
@@ -2681,6 +2318,10 @@ async def send_premium_menu(message, user_id: int):
     for key, plan in PREMIUM_PLANS.items():
         if plan.get("is_addon"):
             continue
+            # TEMP: hidden to push weekly/monthly upgrades — restore by uncommenting (search "TEMP: hide-day-plan")
+            if key == "day":
+                continue
+
         addon_tag = " (Add-on)" if plan.get("is_addon") else ""
         rows.append([InlineKeyboardButton(
             f"💳 {plan['label']}{addon_tag} - ₹{plan['amount_inr']} / ⭐️{plan.get('stars', '-')}",
@@ -2717,95 +2358,7 @@ async def send_quota_topup_menu(message, user_id: int, daily_limit: int):
     )
 
 
-# --- Premium expiry reminder: only the "primary" bot DMs each user ---
-def _should_this_bot_notify(client: Client, bots_map: dict | None) -> bool:
-    """
-    All 3 bots are deployed separately but share one DB, so every instance's
-    reminder loop sees the same premium user doc. Only the bot the user most
-    recently used should actually send the DM, or all 3 would message them.
-    """
-    if not bots_map:
-        return True
-    best_key, best_ts = None, None
-    for k, v in bots_map.items():
-        ts = (v or {}).get("last_seen_at")
-        if isinstance(ts, datetime) and (best_ts is None or ts > best_ts):
-            best_key, best_ts = k, ts
-    if best_key is None:
-        return True
-    return best_key == getattr(client, "bot_key", None)
-
-
-async def _send_premium_expiry_reminders(client: Client) -> None:
-    if users_col is None:
-        return
-    now = _utc_now()
-    cursor = users_col.find(
-        {
-            "premium_until": {"$type": "date"},
-            "premium_tracking_enabled": True,
-        },
-        {"user_id": 1, "premium_until": 1, "premium_reminders": 1, "bots": 1}
-    )
-    async for doc in cursor:
-        user_id = int(doc.get("user_id") or 0)
-        premium_until = doc.get("premium_until")
-        reminders = doc.get("premium_reminders") or {}
-        if not user_id or not isinstance(premium_until, datetime):
-            continue
-        if not _should_this_bot_notify(client, doc.get("bots")):
-            continue
-        if premium_until.tzinfo is None:
-            premium_until = premium_until.replace(tzinfo=timezone.utc)
-        delta = premium_until - now
-        set_fields = {}
-        try:
-            if delta.total_seconds() <= 0:
-                if not reminders.get("expired_sent"):
-                    # Avoid mass messaging historical expired users on first deploy.
-                    # Notify only if expiry happened recently.
-                    recently_expired = delta >= timedelta(hours=-max(1, PREMIUM_END_REMINDER_WINDOW_HOURS))
-                    if recently_expired:
-                        await client.send_message(
-                            user_id,
-                            "⚠️ Your premium plan has ended.\nUse /premium to renew and continue premium benefits."
-                        )
-                    set_fields["premium_reminders.expired_sent"] = True
-            elif delta <= timedelta(hours=3):
-                if not reminders.get("h3_sent"):
-                    await client.send_message(
-                        user_id,
-                        "⏰ Reminder: Your premium plan will expire in about 3 hours."
-                    )
-                    set_fields["premium_reminders.h3_sent"] = True
-            elif delta <= timedelta(days=1):
-                if not reminders.get("d1_sent"):
-                    await client.send_message(
-                        user_id,
-                        "📅 Reminder: Your premium plan will expire in about 1 day."
-                    )
-                    set_fields["premium_reminders.d1_sent"] = True
-        except Exception:
-            continue
-        if set_fields:
-            set_fields["updated_at"] = _utc_now()
-            await users_col.update_one({"user_id": user_id}, {"$set": set_fields}, upsert=True)
-
-
-async def _premium_reminder_loop(client: Client) -> None:
-    while True:
-        try:
-            await _send_premium_expiry_reminders(client)
-        except Exception as e:
-            await report_error(client, "premium_reminder_loop", e)
-        await asyncio.sleep(30 * 60)
-
-
-# ============================================================
-# Handlers (ported from working.py)
-# ============================================================
-
-# ----- /start -----
+# ===== START HANDLER =====
 @app.on_message(filters.command("start"))
 async def start(client, message):
     user_id = message.from_user.id
@@ -2825,32 +2378,6 @@ async def start(client, message):
         token = args[1]
         if token == "premium":
             return await send_premium_menu(message, user_id)
-
-        # Refer payload: ref_<referrer_id> — mark pending and show a confirm button.
-        if token.startswith("ref_"):
-            try:
-                referrer_id = int(token[4:])
-            except Exception:
-                return await message.reply("Invalid referral link.")
-            if referrer_id == user_id:
-                return await message.reply("You can't refer yourself.")
-            if user_id in referral_pending or users_col is None:
-                return await message.reply("Referral system not ready. Try again later.")
-            referral_pending[user_id] = {
-                "referrer_id": referrer_id,
-                "created_at": _now_ts(),
-            }
-            return await message.reply(
-                "🎁 <b>Referral detected!</b>\n\n"
-                "You joined via someone's invite. Tap the button below to confirm "
-                "and credit the inviter with bonus downloads.\n\n"
-                "<i>This is required only once.</i>",
-                parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Confirm Referral", callback_data=f"refconfirm:{user_id}")]
-                ]),
-            )
 
         if not QUOTA_ENABLED:
             return await send_premium_required_once(client, message, user_id)
@@ -2884,75 +2411,6 @@ async def start(client, message):
     )
 
 
-# ----- Referral confirmation -----
-@app.on_callback_query(filters.regex(r"^refconfirm:(\d+)$"))
-async def refconfirm_cb(client, callback_query):
-    user_id = int(callback_query.data.split(":", 1)[1])
-    clicker = int(callback_query.from_user.id)
-    if clicker != user_id:
-        return await callback_query.answer("Not your confirmation.", show_alert=True)
-    pending = referral_pending.get(user_id)
-    if not pending:
-        return await callback_query.answer("No pending referral.", show_alert=True)
-    referrer_id = int(pending.get("referrer_id") or 0)
-    if not referrer_id or referrer_id == user_id:
-        return await callback_query.answer("Invalid referral.", show_alert=True)
-    if users_col is None or referrals_col is None:
-        return await callback_query.answer("Referral system not ready.", show_alert=True)
-
-    # Idempotent: if already confirmed, no-op.
-    already = await referrals_col.find_one({"referee_id": int(user_id)}, {"_id": 1})
-    if already:
-        referral_pending.pop(user_id, None)
-        try:
-            await callback_query.message.edit("✅ Referral already confirmed.")
-        except Exception:
-            pass
-        return await callback_query.answer("Already confirmed.", show_alert=False)
-
-    try:
-        await referrals_col.insert_one({
-            "referrer_id": int(referrer_id),
-            "referee_id": int(user_id),
-            "confirmed": True,
-            "created_at": _utc_now(),
-        })
-    except Exception:
-        return await callback_query.answer("Could not record referral.", show_alert=True)
-
-    # Credit the referrer with bonus quota.
-    if REFERRAL_BONUS_EVERY_N <= 0:
-        REFERRAL_BONUS_EVERY_N = 1
-    count = await _get_referral_count(referrer_id)
-    if count % REFERRAL_BONUS_EVERY_N == 0:
-        await _add_bonus_quota(referrer_id, REFERRAL_BONUS_QUOTA)
-
-    referral_pending.pop(user_id, None)
-    try:
-        await callback_query.message.edit(
-            "🎉 <b>Referral confirmed!</b>\n\n"
-            "Thanks for joining. The inviter has been credited with bonus downloads.",
-            parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-    except Exception:
-        pass
-    try:
-        new_bonus = await _get_bonus_quota(referrer_id)
-        await client.send_message(
-            referrer_id,
-            f"🎉 A new user joined via your link!\n"
-            f"+{REFERRAL_BONUS_QUOTA} bonus credit added.\n"
-            f"Total bonus banked: <b>{new_bonus}</b>",
-            parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-    except Exception:
-        pass
-    await callback_query.answer("Confirmed!", show_alert=False)
-
-
-# ----- /premium -----
 @app.on_message(filters.command("premium"))
 async def premium_cmd(client, message):
     user_id = message.from_user.id
@@ -2962,7 +2420,6 @@ async def premium_cmd(client, message):
     await send_premium_menu(message, user_id)
 
 
-# ----- /myplan -----
 @app.on_message(filters.command("myplan"))
 async def myplan_cmd(client, message):
     user_id = message.from_user.id
@@ -2973,44 +2430,15 @@ async def myplan_cmd(client, message):
     await message.reply(text, reply_markup=markup)
 
 
-# ----- /status -----
 @app.on_message(filters.command("status"))
 async def status_cmd(client, message):
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
     if int(user_id) not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
-    await message.reply(
-        await _status_text(client.bot_key),
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh", callback_data="status_refresh")],
-        ]),
-    )
+    await message.reply(await _status_text(client.bot_key))
 
 
-@app.on_callback_query(filters.regex("^status_refresh$"))
-async def status_refresh_cb(client, callback_query):
-    if int(callback_query.from_user.id) not in ADMIN_USER_IDS:
-        return await callback_query.answer("❌ Not allowed.", show_alert=True)
-    try:
-        await callback_query.answer("Refreshing…")
-    except Exception:
-        pass
-    bot_key = getattr(client, "bot_key", None) or _current_bot_username(client)
-    try:
-        await callback_query.message.edit_text(
-            await _status_text(bot_key),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data="status_refresh")],
-            ]),
-        )
-    except MessageNotModified:
-        pass
-    except Exception as e:
-        await report_error(client, "status_refresh", e)
-
-
-# ----- /shortlink_on|off -----
 @app.on_message(filters.command("shortlink_on"))
 async def shortlink_on_cmd(client, message):
     global QUOTA_ENABLED
@@ -3019,6 +2447,7 @@ async def shortlink_on_cmd(client, message):
         return await message.reply("❌ You are not allowed to use this command.")
     QUOTA_ENABLED = True
     return await message.reply("OK. Shortlink unlock ENABLED. After free quota, users can watch an ad to get more downloads.")
+    await message.reply("✅ Quota mechanism ENABLED. Free users now go through the shortlink/ad-unlock flow.")
 
 
 @app.on_message(filters.command("shortlink_off"))
@@ -3029,9 +2458,9 @@ async def shortlink_off_cmd(client, message):
         return await message.reply("❌ You are not allowed to use this command.")
     QUOTA_ENABLED = False
     return await message.reply("OK. Shortlink unlock DISABLED. Free users still get 3 downloads, then must buy premium.")
+    await message.reply("✅ Quota mechanism DISABLED. All users get unlimited downloads (no credit checks).")
 
 
-# ----- /freemode_on|off -----
 @app.on_message(filters.command("freemode_on"))
 async def freemode_on_cmd(client, message):
     global FREE_MODE_ENABLED
@@ -3052,7 +2481,6 @@ async def freemode_off_cmd(client, message):
     await message.reply("✅ Free mode DISABLED. Normal quota/premium rules apply again.")
 
 
-# ----- /sendfile_on|off -----
 @app.on_message(filters.command("sendfile_on"))
 async def sendfile_on_cmd(client, message):
     global SENDFILE_ENABLED
@@ -3075,7 +2503,6 @@ async def sendfile_off_cmd(client, message):
     )
 
 
-# ----- /broadcast -----
 @app.on_message(filters.command("broadcast"))
 async def broadcast_cmd(client, message):
     user_id = message.from_user.id
@@ -3191,7 +2618,7 @@ async def broadcast_cmd(client, message):
     )
 
 
-# ----- /usage -----
+# ===== MAIN HANDLER =====
 @app.on_message(filters.command("usage"))
 async def usage_cmd(client, message):
     user_id = message.from_user.id
@@ -3217,11 +2644,50 @@ async def usage_cmd(client, message):
     await status.edit(_format_api_usage(data))
 
 
-# ----- Main catch-all: diskwala links -----
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.2f}{unit}"
+        n /= 1024
+    return f"{n:.2f}TB"
+
+
+def _format_usage_value(key, value):
+    key_lower = key.lower()
+    if any(part in key_lower for part in ("key", "token", "secret", "password")):
+        return "***"
+    if isinstance(value, (int, float)) and any(
+        part in key_lower for part in ("size", "bytes", "bandwidth", "traffic", "storage")
+    ):
+        return _human_size(value)
+    return str(value)
+
+
+def _format_api_usage(data: dict) -> str:
+    if not data:
+        return "Usage info is empty."
+
+    lines = ["Usage:"]
+
+    def add_items(items, prefix=""):
+        for key, value in items.items():
+            label = f"{prefix}{str(key).replace('_', ' ').title()}"
+            if isinstance(value, dict):
+                lines.append(f"{label}:")
+                add_items(value, prefix="  ")
+            elif isinstance(value, list):
+                lines.append(f"{label}: {', '.join(map(str, value)) if value else 'None'}")
+            else:
+                lines.append(f"{label}: {_format_usage_value(str(key), value)}")
+
+    add_items(data)
+    return "\n".join(lines)
+
+
 @app.on_message(filters.private & ~filters.command([
     "start", "premium", "myplan", "status", "usage", "broadcast",
     "shortlink_on", "shortlink_off", "freemode_on", "freemode_off",
-    "sendfile_on", "sendfile_off", "refer",
+    "sendfile_on", "sendfile_off",
 ]))
 async def diskwala(client, message):
     user_id = message.from_user.id
@@ -3244,6 +2710,8 @@ async def diskwala(client, message):
             pass
         return
 
+    # Ignore plain texts without URL-like content to avoid noisy replies.
+    # This keeps bot responses focused on actual link attempts only.
     if "http://" not in (text or "") and "https://" not in (text or ""):
         return
 
@@ -3294,14 +2762,15 @@ async def diskwala(client, message):
                         f"Failed ❌\n\n{err_msg}",
                         reply_markup=_support_markup(),
                     )
+                # refund reserved credit because request didn't succeed
                 if not skip_quota:
                     await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
-                continue
+                continue  # do NOT consume credits for invalid links
 
             name = result["name"]
             size_mb = result["size_mb"]
             link = result["link"]
-            stream = result.get("stream", "")
+            stream = result["stream"]
             thumbnail = result["thumbnail"]
 
             ftoken = create_file_token(link, name, size_mb, stream, user_id)
@@ -3312,7 +2781,6 @@ async def diskwala(client, message):
                 name=name,
                 size_mb=size_mb,
                 download_url=link,
-                is_premium=is_premium,
             )
 
             if not markup:
@@ -3342,81 +2810,6 @@ async def diskwala(client, message):
             pass
 
 
-# ----- /dlfile: callback (download via CF Worker or local upload) -----
-@app.on_callback_query(filters.regex(r"^dlfile:([a-zA-Z0-9]{16})$"))
-async def download_file_cb(client, callback_query):
-    user_id = callback_query.from_user.id
-    token = callback_query.data.split(":", 1)[1]
-    data = file_tokens.get(token)
-    if not data or data.get("expires_at", 0) <= _now_ts():
-        return await callback_query.answer("Session expired. Send the link again.", show_alert=True)
-    if int(data.get("user_id", 0)) != user_id:
-        return await callback_query.answer("Not your request.", show_alert=True)
-
-    link = (data.get("link") or "").strip()
-    name = data.get("name") or "file"
-    size_mb = float(data.get("size_mb") or 0)
-
-    if not _is_valid_http_url(link):
-        return await callback_query.answer("File URL unavailable.", show_alert=True)
-
-    if size_mb > TELEGRAM_MAX_UPLOAD_MB:
-        return await callback_query.answer(
-            f"File exceeds Telegram limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). Use Watch Online.",
-            show_alert=True,
-        )
-
-    await callback_query.answer("Sending file…")
-
-    msg_id = await _send_file_free(
-        chat_id=callback_query.message.chat.id,
-        cdn_url=link,
-        name=name,
-        size_mb=size_mb,
-        caption=_file_caption(name, size_mb),
-    )
-    if msg_id is not None:
-        _schedule_delete_message(client, callback_query.message.chat.id, msg_id)
-        return
-
-    # Both CDN-direct and CF Worker paths failed (CDN throttle / network reset).
-    # Fall back to the local download→upload path that gfile: uses.
-    try:
-        await callback_query.message.reply(
-            "Direct send failed (CDN throttle). Falling back to server upload…"
-        )
-    except Exception:
-        pass
-
-    job_id = "".join(random.choices("0123456789abcdef", k=8))
-    _file_transfer_jobs[job_id] = {"cancel": asyncio.Event(), "user_id": user_id}
-    est_total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
-    est_eta_note = ""
-    if size_mb > 0:
-        est_eta_note = f"\nEstimated size: {size_mb} MB — speed and ETA update live below."
-
-    progress_msg = await callback_query.message.reply(
-        _transfer_progress_text(
-            name=name, size_mb=size_mb, phase="Preparing",
-            current=0, total=est_total, speed_bps=0, elapsed=0,
-        ) + est_eta_note,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
-        ]),
-    )
-
-    asyncio.create_task(_run_get_file_transfer(
-        client,
-        chat_id=progress_msg.chat.id,
-        progress_msg_id=progress_msg.id,
-        job_id=job_id,
-        link=link,
-        name=name,
-        size_mb=size_mb,
-    ))
-
-
-# ----- /gfile: callback (Get File — premium direct local transfer) -----
 @app.on_callback_query(filters.regex(r"^gfile:([a-zA-Z0-9]{16})$"))
 async def get_file_cb(client, callback_query):
     user_id = callback_query.from_user.id
@@ -3485,7 +2878,6 @@ async def get_file_cb(client, callback_query):
     ))
 
 
-# ----- /gfcancel: cancel transfer -----
 @app.on_callback_query(filters.regex(r"^gfcancel:([a-f0-9]{8})$"))
 async def get_file_cancel_cb(client, callback_query):
     user_id = callback_query.from_user.id
@@ -3499,7 +2891,6 @@ async def get_file_cancel_cb(client, callback_query):
     await callback_query.answer("Cancelling…", show_alert=False)
 
 
-# ----- /bcancel: cancel broadcast -----
 @app.on_callback_query(filters.regex(r"^bcancel:([a-f0-9]{8})$"))
 async def broadcast_cancel_cb(client, callback_query):
     if int(callback_query.from_user.id) not in ADMIN_USER_IDS:
@@ -3512,7 +2903,6 @@ async def broadcast_cancel_cb(client, callback_query):
     await callback_query.answer("Cancelling broadcast…", show_alert=False)
 
 
-# ----- Force-sub join request recording -----
 @app.on_chat_join_request()
 async def force_sub_join_request(client, join_request):
     """Record join requests so a pending user still passes the force-sub gate.
@@ -3530,7 +2920,6 @@ async def force_sub_join_request(client, join_request):
         await report_error(client, "force_sub_join_request", e)
 
 
-# ----- /check_join callback -----
 @app.on_callback_query(filters.regex(r"^check_join$"))
 async def check_join_cb(client, callback_query):
     user_id = callback_query.from_user.id
@@ -3550,6 +2939,7 @@ async def check_join_cb(client, callback_query):
         await callback_query.answer("Verified ✅", show_alert=False)
         return
 
+    # Still pending: keep only the channels they haven't joined yet.
     names = ", ".join([await _force_sub_label(client, t) for t in missing])
     try:
         await callback_query.message.edit_reply_markup(await _join_markup(client, missing))
@@ -3562,7 +2952,6 @@ async def check_join_cb(client, callback_query):
     await callback_query.answer(alert, show_alert=True)
 
 
-# ----- /buyplan callback -----
 @app.on_callback_query(filters.regex(r"^buyplan:([a-zA-Z0-9_]+)$"))
 async def buy_plan_cb(client, callback_query):
     user_id = callback_query.from_user.id
@@ -3585,7 +2974,6 @@ async def buy_plan_cb(client, callback_query):
     )
 
 
-# ----- /paymethod callback -----
 @app.on_callback_query(filters.regex(r"^paymethod:([a-zA-Z0-9_]+):(upiqr|cards|stars)$"))
 async def pay_method_cb(client, callback_query):
     user_id = callback_query.from_user.id
@@ -3715,7 +3103,6 @@ async def pay_method_cb(client, callback_query):
         await callback_query.message.reply("Failed to create payment link. Please try again in a moment.")
 
 
-# ----- /checkpay callback -----
 @app.on_callback_query(filters.regex(r"^checkpay:"))
 async def check_pay_cb(client, callback_query):
     user_id = callback_query.from_user.id
@@ -3823,7 +3210,6 @@ async def check_pay_cb(client, callback_query):
         await callback_query.message.reply("❌ Could not verify payment right now. Please try again shortly.")
 
 
-# ----- /cancelpay callback -----
 @app.on_callback_query(filters.regex(r"^cancelpay:"))
 async def cancel_pay_cb(client, callback_query):
     user_id = callback_query.from_user.id
@@ -3849,7 +3235,6 @@ async def cancel_pay_cb(client, callback_query):
     await callback_query.message.reply("❌ Payment session cancelled.\nUse /premium to create a new payment.")
 
 
-# ----- Stars payment (raw updates) -----
 @app.on_raw_update()
 async def stars_payment_raw(client, update, users, chats):
     try:
@@ -3906,10 +3291,6 @@ async def stars_payment_raw(client, update, users, chats):
     except Exception as e:
         await report_error(client, "stars_payment_raw", e)
 
-
-# ============================================================
-# Quart routes (payment checkout + player + hls proxy + health)
-# ============================================================
 
 @bot.get("/premium/checkout/<pay_token>")
 async def premium_checkout(pay_token: str):
@@ -4164,12 +3545,98 @@ async def razorpay_webhook():
     return {"ok": True}
 
 
+def _should_this_bot_notify(client: Client, bots_map: dict | None) -> bool:
+    """
+    All 3 bots are deployed separately but share one DB, so every instance's
+    reminder loop sees the same premium user doc. Only the bot the user most
+    recently used should actually send the DM, or all 3 would message them.
+    """
+    if not bots_map:
+        return True
+    best_key, best_ts = None, None
+    for k, v in bots_map.items():
+        ts = (v or {}).get("last_seen_at")
+        if isinstance(ts, datetime) and (best_ts is None or ts > best_ts):
+            best_key, best_ts = k, ts
+    if best_key is None:
+        return True
+    return best_key == getattr(client, "bot_key", None)
+
+
+async def _send_premium_expiry_reminders(client: Client) -> None:
+    if users_col is None:
+        return
+    now = _utc_now()
+    cursor = users_col.find(
+        {
+            "premium_until": {"$type": "date"},
+            "premium_tracking_enabled": True,
+        },
+        {"user_id": 1, "premium_until": 1, "premium_reminders": 1, "bots": 1}
+    )
+    async for doc in cursor:
+        user_id = int(doc.get("user_id") or 0)
+        premium_until = doc.get("premium_until")
+        reminders = doc.get("premium_reminders") or {}
+        if not user_id or not isinstance(premium_until, datetime):
+            continue
+        if not _should_this_bot_notify(client, doc.get("bots")):
+            continue
+        if premium_until.tzinfo is None:
+            premium_until = premium_until.replace(tzinfo=timezone.utc)
+        delta = premium_until - now
+        set_fields = {}
+        try:
+            if delta.total_seconds() <= 0:
+                if not reminders.get("expired_sent"):
+                    # Avoid mass messaging historical expired users on first deploy.
+                    # Notify only if expiry happened recently.
+                    recently_expired = delta >= timedelta(hours=-max(1, PREMIUM_END_REMINDER_WINDOW_HOURS))
+                    if recently_expired:
+                        await client.send_message(
+                            user_id,
+                            "⚠️ Your premium plan has ended.\nUse /premium to renew and continue premium benefits."
+                        )
+                    set_fields["premium_reminders.expired_sent"] = True
+            elif delta <= timedelta(hours=3):
+                if not reminders.get("h3_sent"):
+                    await client.send_message(
+                        user_id,
+                        "⏰ Reminder: Your premium plan will expire in about 3 hours."
+                    )
+                    set_fields["premium_reminders.h3_sent"] = True
+            elif delta <= timedelta(days=1):
+                if not reminders.get("d1_sent"):
+                    await client.send_message(
+                        user_id,
+                        "📅 Reminder: Your premium plan will expire in about 1 day."
+                    )
+                    set_fields["premium_reminders.d1_sent"] = True
+        except Exception:
+            continue
+        if set_fields:
+            set_fields["updated_at"] = _utc_now()
+            await users_col.update_one({"user_id": user_id}, {"$set": set_fields}, upsert=True)
+
+
+async def _premium_reminder_loop(client: Client) -> None:
+    while True:
+        try:
+            await _send_premium_expiry_reminders(client)
+        except Exception as e:
+            await report_error(client, "premium_reminder_loop", e)
+        await asyncio.sleep(30 * 60)
+
+
 @bot.get("/player/<token>")
 async def player(token: str):
     data = stream_tokens.get(token)
     if not data or data.get("expires_at", 0) <= _now_ts():
         return Response("Stream link expired. Go back to the bot and generate again.", status=410)
 
+    # Try the upstream CDN directly first (0 Render/Railway bandwidth). Only fall back
+    # to our /hls proxy client-side if direct playback actually fails (e.g. no CORS
+    # headers from that source) — see fallback logic in the player script below.
     direct_src = data['url']
     proxied_m3u8 = f"/hls?u={quote_plus(data['url'])}"
 
@@ -4199,10 +3666,13 @@ async def player(token: str):
       .header .titles .s {{ font-size: 12px; color: #8b93a7; margin-top: 2px; }}
       .player {{ position: relative; margin: 14px; border-radius: 14px; overflow: hidden; background: #000; }}
       video {{ width: 100%; display: block; aspect-ratio: 16/9; background: #000; }}
+      /* Telegram's WebView blocks requestFullscreen() on a container element,
+         so this CSS overlay is the fallback "fullscreen" for that case. */
       .player.fake-fs {{ position: fixed; inset: 0; margin: 0; border-radius: 0; z-index: 9999;
         display: flex; align-items: center; justify-content: center; }}
       .player.fake-fs video {{ width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }}
       body.fs-lock {{ overflow: hidden; }}
+      /* Native fullscreen path: stretch the video to the whole screen too. */
       .player:fullscreen {{ margin: 0; border-radius: 0; display: flex; align-items: center; justify-content: center; }}
       .player:fullscreen video {{ width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; }}
       .player:-webkit-full-screen {{ margin: 0; border-radius: 0; }}
@@ -4394,6 +3864,11 @@ async def player(token: str):
       let usingProxy = false;
       let currentHls = null;
 
+      // DiskWala serves a progressive MP4/MOV, not HLS, and its CDN sends no
+      // Access-Control-Allow-Origin. A plain <video src> needs no CORS and
+      // streams straight from the CDN (zero Railway egress); hls.js fetches by
+      // XHR, which that CDN blocks. So only hand real .m3u8 manifests to hls.js
+      // -- otherwise every Android client fails AND proxies the file through us.
       function isHlsUrl(u) {{
         try {{
           return /\.m3u8$/i.test(decodeURIComponent(String(u).split('?')[0].split('#')[0]));
@@ -4410,6 +3885,7 @@ async def player(token: str):
           currentHls = null;
         }}
         if (!sourceIsHls) {{
+          // Progressive file: let the browser stream it natively.
           video.src = url;
           return;
         }}
@@ -4430,6 +3906,8 @@ async def player(token: str):
         }}
       }}
 
+      // Direct-from-CDN first (saves bandwidth); silently fall back to the
+      // proxy on real playback failure (e.g. source has no CORS headers).
       video.addEventListener('error', () => {{
         if (!usingProxy) loadSrc(proxiedSrc, true);
       }});
@@ -4474,6 +3952,11 @@ async def player(token: str):
       document.getElementById('back10').addEventListener('click', () => {{ video.currentTime = Math.max(0, video.currentTime - 10); }});
       document.getElementById('fwd10').addEventListener('click', () => {{ video.currentTime = Math.min(video.duration || 1e9, video.currentTime + 10); }});
       document.getElementById('muteBtn').addEventListener('click', () => {{ video.muted = !video.muted; }});
+      // ===== Fullscreen =====
+      // Telegram's WebView blocks requestFullscreen() on a container element, and
+      // the Mini App itself runs in a partial-height sheet, so the plain
+      // el.requestFullscreen() call this replaced silently did nothing. Try each
+      // mechanism in turn and fall back to a CSS overlay.
       const playerEl = document.querySelector('.player');
       const fsBtn = document.getElementById('fsBtn');
       const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
@@ -4496,6 +3979,8 @@ async def player(token: str):
         fakeFs = true;
         playerEl.classList.add('fake-fs');
         document.body.classList.add('fs-lock');
+        // Bot API 8.0+: make the Mini App sheet itself cover the screen,
+        // otherwise the overlay only fills the half-height sheet.
         try {{ if (tg && tg.requestFullscreen) tg.requestFullscreen(); }} catch (e) {{}}
         lockLandscape();
       }}
@@ -4509,7 +3994,7 @@ async def player(token: str):
       function enterFullscreen() {{
         if (document.fullscreenEnabled && playerEl.requestFullscreen) {{
           const p = playerEl.requestFullscreen();
-          if (p && p.catch) p.catch(fakeFsOn);
+          if (p && p.catch) p.catch(fakeFsOn); // rejected (common in webviews)
           lockLandscape();
           return;
         }}
@@ -4518,6 +4003,7 @@ async def player(token: str):
           lockLandscape();
           return;
         }}
+        // iOS WKWebView allows only the <video> element to enter fullscreen.
         if (video.webkitEnterFullscreen) {{ video.webkitEnterFullscreen(); return; }}
         fakeFsOn();
       }}
@@ -4539,10 +4025,18 @@ async def player(token: str):
     return Response(page, mimetype="text/html")
 
 
+_HLS_FORWARD_RESPONSE_HEADERS = ("Content-Range", "Accept-Ranges")
+
+
 @bot.get("/hls")
 async def hls_proxy():
     """
     Proxy + rewrite m3u8/segments to same-origin URLs to avoid WebView CORS issues.
+
+    Manifests are small and get fully buffered (needed to rewrite segment URLs).
+    Everything else (.ts/.aac/.mp4 chunks) is streamed straight through without
+    buffering the whole body in memory, and incoming Range requests are forwarded
+    upstream so video seeking doesn't force a full-file re-download/re-serve.
     """
     u = request.args.get("u", "")
     if not u:
@@ -4606,19 +4100,14 @@ async def health():
     return {"ok": True, "service": "diskwala-downloader-bot"}, 200
 
 
-# ============================================================
-# Quart lifecycle hooks + main entry
-# ============================================================
-
 @bot.before_serving
 async def before_serving():
-    global mongo_client, mongo_db, users_col, payments_col, referrals_col, premium_reminder_task
+    global mongo_client, mongo_db, users_col, payments_col, premium_reminder_task
     if MONGO_URI and AsyncIOMotorClient is not None:
         mongo_client = AsyncIOMotorClient(MONGO_URI)
         mongo_db = mongo_client[MONGO_DB_NAME]
         users_col = mongo_db["users"]
         payments_col = mongo_db["payments"]
-        referrals_col = mongo_db["referrals"]
         await users_col.create_index("bot_keys")
     else:
         logger.warning("MongoDB not configured or motor missing; premium persistence disabled.")
@@ -4644,6 +4133,9 @@ async def after_serving():
         mongo_client.close()
 
 
+# if __name__ == '__main__':
+
+# bot.run(port=8000)
 if __name__ == '__main__':
     # Render (and most PaaS) inject the bind port via $PORT.
     port = int(os.getenv("PORT", "8080"))

@@ -1,7 +1,14 @@
+# Secrets and local state
 .env
-.env.*
-__pycache__/
-*.py[cod]
-downloads/
 *.session
 *.session-journal
+__pycache__/
+downloads/
+
+# Editor
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
