@@ -466,27 +466,22 @@ async def _referral_link(client, user_id: int) -> str:
 
 
 async def _apply_purchase(user_id: int, plan_key: str, payment_id: str = "") -> tuple[str, bool]:
-    """Apply a plan to a user. Returns (result_text, was_new).
+    """Apply a paid purchase. Returns (user_message, was_new_purchase).
 
-    For premium (days > 0) plans: if the user already has active premium,
-    returns a friendly skip message and was_new=False (no double stacking).
-    For quota-addon plans: always applies and was_new=True.
-    Callers should gate admin notify on was_new so duplicate purchases
-    do not spam the admin channel.
+    Dedup of duplicate Razorpay payment_ids is the caller's
+    responsibility: callers must hold the per-user lock and must check
+    `payment_id` against the `payments` collection before calling.
+    This function only applies the plan.
+
+    was_new_purchase is always True for a real apply (premium reset
+    or quota top-up). Admin notifications should be gated on it so a
+    genuine webhook + manual-check race doesn't double-notify, but the
+    plan still gets applied exactly once.
     """
     plan = PREMIUM_PLANS[plan_key]
     if int(plan.get("days", 0)) > 0:
-        lock = _get_user_lock(user_id)
-        async with lock:
-            active = await _get_premium_until(user_id)
-            if active and active > _utc_now():
-                return (
-                    f"ℹ️ Premium already active till {active.strftime('%Y-%m-%d %H:%M UTC')}. "
-                    "Skipping duplicate purchase.",
-                    False,
-                )
-            until = await _apply_premium_plan(user_id, plan_key, payment_id=payment_id)
-            return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}", True
+        until = await _apply_premium_plan(user_id, plan_key, payment_id=payment_id)
+        return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}", True
     if int(plan.get("quota_add", 0)) > 0:
         added = await _apply_quota_addon(user_id, plan_key)
         return f"✅ Quota top-up successful. Added +{added} downloads for today.", True
