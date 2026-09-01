@@ -3718,34 +3718,34 @@ async def check_pay_cb(client, callback_query):
         if payments_col is None:
             return await callback_query.message.reply("Payment check needs database enabled. Please try later.")
 
-        # Reference-id dedup: if the same pay_ref was already marked paid,
-        # short-circuit before hitting Razorpay. Prevents the
-        # 'click I have paid N times' path from re-running the full verify
-        # and re-firing admin notifications.
-        already_processed = await payments_col.find_one(
-            {"pay_ref": pay_ref, "status": "paid"},
-            {"_id": 1, "paid_at": 1, "plan_key": 1, "payment_id": 1},
-        )
-        if already_processed:
-            plan_key_cached = already_processed.get("plan_key") or ""
-            return await callback_query.message.reply(
-                "✅ Payment already processed for this reference.\n"
-                f"Plan: {plan_key_cached or '—'}\n"
-                f"Paid at: {already_processed.get('paid_at') or 'earlier'}"
-            )
-
         # Serialize concurrent taps of "I have paid" for the same user so
-        # two callbacks can't both pass the dedup check and double-apply.
+        # two callbacks can't race and double-apply. The actual dedup
+        # against the same Razorpay payment is done inside via
+        # `payment_id` (which is stable across retries, unlike our
+        # per-session `pay_ref` which changes on every Buy click).
         async with _get_user_lock(user_id):
             attempt = await payments_col.find_one(
                 {"pay_ref": pay_ref},
-                {"payment_link_id": 1, "qr_code_id": 1, "user_id": 1, "plan_key": 1, "expires_at": 1}
+                {"payment_link_id": 1, "qr_code_id": 1, "user_id": 1, "plan_key": 1, "expires_at": 1, "status": 1}
             )
             if not attempt:
                 return await callback_query.message.reply(
                     "❌ Payment session not found. Please generate a new plan payment.")
             if int(attempt.get("user_id") or 0) != int(user_id):
                 return await callback_query.message.reply("❌ This payment session belongs to another user.")
+
+            # If this session is already paid (e.g. webhook already
+            # processed it, or user is tapping an old button), reply
+            # with current premium status so they aren't left wondering
+            # what happened.
+            if (attempt.get("status") or "").lower() == "paid":
+                await _close_payment_session(pay_ref)
+                current_premium = await _get_premium_until(user_id)
+                if current_premium and current_premium > _utc_now():
+                    extra = f"\nYour premium is active till {current_premium.strftime('%Y-%m-%d %H:%M UTC')}."
+                else:
+                    extra = "\nNo active premium on your account. If you just paid, wait a few seconds and try again."
+                return await callback_query.message.reply(f"✅ Payment already processed.{extra}")
 
             expires_at = float(attempt.get("expires_at") or 0)
             if expires_at and _now_ts() > expires_at:
@@ -3828,7 +3828,12 @@ async def check_pay_cb(client, callback_query):
                     await _notify_purchase(client, user_id, plan_key, payment_id=payment_id, source="manual_check")
             else:
                 await _close_payment_session(pay_ref)
-                await callback_query.message.reply("✅ Payment already processed.")
+                current_premium = await _get_premium_until(user_id)
+                if current_premium and current_premium > _utc_now():
+                    extra = f"\nYour premium is active till {current_premium.strftime('%Y-%m-%d %H:%M UTC')}."
+                else:
+                    extra = "\nNo active premium on your account."
+                await callback_query.message.reply(f"✅ Payment already processed.{extra}")
     except Exception as e:
         await report_error(client, "check_pay_cb", e, extra={"user_id": user_id, "pay_ref": pay_ref})
         await callback_query.message.reply("❌ Could not verify payment right now. Please try again shortly.")
