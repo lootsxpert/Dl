@@ -1423,8 +1423,8 @@ def _build_file_options_markup(
                 web_app=WebAppInfo(url=web_app_url),
             )])
     # Download — shown to everyone. Free users tap → popup "Premium only";
-    # premium users tap → bot calls _send_file_free (≤50MB direct CDN, >50MB
-    # falls back to local download+upload).
+    # premium users tap → get a "Click here to download" external-URL button
+    # that opens the file in their browser. No Telegram upload.
     if _is_valid_http_url(download_url) or _is_valid_http_url(stream):
         rows.append([InlineKeyboardButton(
             "⬇️ Download",
@@ -3342,9 +3342,16 @@ async def diskwala(client, message):
             pass
 
 
-# ----- /dlfile: callback (download via CF Worker or local upload) -----
+# ----- /dlfile: callback (Download — premium external URL, no Telegram upload) -----
 @app.on_callback_query(filters.regex(r"^dlfile:([a-zA-Z0-9]{16})$"))
 async def download_file_cb(client, callback_query):
+    """
+    Premium-only "Download" button. Free users get a popup telling them to
+    upgrade. Premium users get a "Click here to download" link button that
+    opens the external URL in their browser.
+
+    No file is sent to Telegram on this path — that's what gfile: is for.
+    """
     user_id = callback_query.from_user.id
     token = callback_query.data.split(":", 1)[1]
     data = file_tokens.get(token)
@@ -3353,67 +3360,31 @@ async def download_file_cb(client, callback_query):
     if int(data.get("user_id", 0)) != user_id:
         return await callback_query.answer("Not your request.", show_alert=True)
 
-    link = (data.get("link") or "").strip()
-    name = data.get("name") or "file"
-    size_mb = float(data.get("size_mb") or 0)
-
-    if not _is_valid_http_url(link):
-        return await callback_query.answer("File URL unavailable.", show_alert=True)
-
-    if size_mb > TELEGRAM_MAX_UPLOAD_MB:
+    if not await _has_premium_access(user_id):
         return await callback_query.answer(
-            f"File exceeds Telegram limit ({TELEGRAM_MAX_UPLOAD_MB:.0f} MB). Use Watch Online.",
+            "⬇️ Download is a Premium feature. Use Watch Online for free, or /premium to upgrade.",
             show_alert=True,
         )
 
-    await callback_query.answer("Sending file…")
+    link = (data.get("link") or data.get("stream") or "").strip()
+    name = data.get("name") or "file"
+    if not _is_valid_http_url(link):
+        return await callback_query.answer("File URL unavailable.", show_alert=True)
 
-    msg_id = await _send_file_free(
-        chat_id=callback_query.message.chat.id,
-        cdn_url=link,
-        name=name,
-        size_mb=size_mb,
-        caption=_file_caption(name, size_mb),
-    )
-    if msg_id is not None:
-        _schedule_delete_message(client, callback_query.message.chat.id, msg_id)
-        return
-
-    # Both CDN-direct and CF Worker paths failed (CDN throttle / network reset).
-    # Fall back to the local download→upload path that gfile: uses.
+    # External link only — no Telegram upload. Get File (gfile:) is the
+    # in-Telegram upload path; this is just the URL.
+    await callback_query.answer()
     try:
         await callback_query.message.reply(
-            "Direct send failed (CDN throttle). Falling back to server upload…"
+            f"⬇️ <b>Download link for {name}</b>\n\n"
+            f"Click the button below to open the download in your browser.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬇️ Click here to download", url=link)],
+            ]),
         )
     except Exception:
         pass
-
-    job_id = "".join(random.choices("0123456789abcdef", k=8))
-    _file_transfer_jobs[job_id] = {"cancel": asyncio.Event(), "user_id": user_id}
-    est_total = int(size_mb * 1024 * 1024) if size_mb > 0 else 0
-    est_eta_note = ""
-    if size_mb > 0:
-        est_eta_note = f"\nEstimated size: {size_mb} MB — speed and ETA update live below."
-
-    progress_msg = await callback_query.message.reply(
-        _transfer_progress_text(
-            name=name, size_mb=size_mb, phase="Preparing",
-            current=0, total=est_total, speed_bps=0, elapsed=0,
-        ) + est_eta_note,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏹ Cancel", callback_data=f"gfcancel:{job_id}")]
-        ]),
-    )
-
-    asyncio.create_task(_run_get_file_transfer(
-        client,
-        chat_id=progress_msg.chat.id,
-        progress_msg_id=progress_msg.id,
-        job_id=job_id,
-        link=link,
-        name=name,
-        size_mb=size_mb,
-    ))
 
 
 # ----- /gfile: callback (Get File — premium direct local transfer) -----
