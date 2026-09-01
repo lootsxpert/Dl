@@ -362,9 +362,11 @@ async def _get_quota_state(user_id: int, daily_limit: int) -> dict:
 async def _apply_premium_plan(user_id: int, plan_key: str, payment_id: str = "") -> datetime:
     plan = PREMIUM_PLANS[plan_key]
     now = _utc_now()
-    current = await _get_premium_until(user_id)
-    base = current if current and current > now else now
-    new_until = base + timedelta(days=plan["days"])
+    # Reset from "now" instead of stacking on top of an active premium
+    # so re-clicking "I have paid" or duplicate webhook deliveries do not
+    # extend days beyond what the user actually paid for. The caller
+    # (_apply_purchase) is responsible for the active-premium short-circuit.
+    new_until = now + timedelta(days=plan["days"])
     if users_col is not None:
         await users_col.update_one(
             {"user_id": int(user_id)},
@@ -463,15 +465,32 @@ async def _referral_link(client, user_id: int) -> str:
     return f"https://t.me/{me.username}?start=ref_{user_id}"
 
 
-async def _apply_purchase(user_id: int, plan_key: str, payment_id: str = "") -> str:
+async def _apply_purchase(user_id: int, plan_key: str, payment_id: str = "") -> tuple[str, bool]:
+    """Apply a plan to a user. Returns (result_text, was_new).
+
+    For premium (days > 0) plans: if the user already has active premium,
+    returns a friendly skip message and was_new=False (no double stacking).
+    For quota-addon plans: always applies and was_new=True.
+    Callers should gate admin notify on was_new so duplicate purchases
+    do not spam the admin channel.
+    """
     plan = PREMIUM_PLANS[plan_key]
     if int(plan.get("days", 0)) > 0:
-        until = await _apply_premium_plan(user_id, plan_key, payment_id=payment_id)
-        return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}"
+        lock = _get_user_lock(user_id)
+        async with lock:
+            active = await _get_premium_until(user_id)
+            if active and active > _utc_now():
+                return (
+                    f"ℹ️ Premium already active till {active.strftime('%Y-%m-%d %H:%M UTC')}. "
+                    "Skipping duplicate purchase.",
+                    False,
+                )
+            until = await _apply_premium_plan(user_id, plan_key, payment_id=payment_id)
+            return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}", True
     if int(plan.get("quota_add", 0)) > 0:
         added = await _apply_quota_addon(user_id, plan_key)
-        return f"✅ Quota top-up successful. Added +{added} downloads for today."
-    return "✅ Purchase processed."
+        return f"✅ Quota top-up successful. Added +{added} downloads for today.", True
+    return "✅ Purchase processed.", False
 
 
 def _format_user_name(user_obj=None, fallback: str = "") -> str:
@@ -857,9 +876,10 @@ async def _process_stars_payment(
             }},
             upsert=True,
         )
-    result_text = await _apply_purchase(effective_user_id, plan_key, payment_id=payment_id)
+    result_text, was_new = await _apply_purchase(effective_user_id, plan_key, payment_id=payment_id)
     await client.send_message(effective_user_id, result_text)
-    await _notify_purchase(client, effective_user_id, plan_key, payment_id=payment_id, source="telegram_stars")
+    if was_new:
+        await _notify_purchase(client, effective_user_id, plan_key, payment_id=payment_id, source="telegram_stars")
 
 
 def _extract_user_id_from_service_message(msg) -> int:
@@ -3698,97 +3718,117 @@ async def check_pay_cb(client, callback_query):
         if payments_col is None:
             return await callback_query.message.reply("Payment check needs database enabled. Please try later.")
 
-        attempt = await payments_col.find_one(
-            {"pay_ref": pay_ref},
-            {"payment_link_id": 1, "qr_code_id": 1, "user_id": 1, "plan_key": 1, "expires_at": 1}
+        # Reference-id dedup: if the same pay_ref was already marked paid,
+        # short-circuit before hitting Razorpay. Prevents the
+        # 'click I have paid N times' path from re-running the full verify
+        # and re-firing admin notifications.
+        already_processed = await payments_col.find_one(
+            {"pay_ref": pay_ref, "status": "paid"},
+            {"_id": 1, "paid_at": 1, "plan_key": 1, "payment_id": 1},
         )
-        if not attempt:
+        if already_processed:
+            plan_key_cached = already_processed.get("plan_key") or ""
             return await callback_query.message.reply(
-                "❌ Payment session not found. Please generate a new plan payment.")
-        if int(attempt.get("user_id") or 0) != int(user_id):
-            return await callback_query.message.reply("❌ This payment session belongs to another user.")
+                "✅ Payment already processed for this reference.\n"
+                f"Plan: {plan_key_cached or '—'}\n"
+                f"Paid at: {already_processed.get('paid_at') or 'earlier'}"
+            )
 
-        expires_at = float(attempt.get("expires_at") or 0)
-        if expires_at and _now_ts() > expires_at:
+        # Serialize concurrent taps of "I have paid" for the same user so
+        # two callbacks can't both pass the dedup check and double-apply.
+        async with _get_user_lock(user_id):
+            attempt = await payments_col.find_one(
+                {"pay_ref": pay_ref},
+                {"payment_link_id": 1, "qr_code_id": 1, "user_id": 1, "plan_key": 1, "expires_at": 1}
+            )
+            if not attempt:
+                return await callback_query.message.reply(
+                    "❌ Payment session not found. Please generate a new plan payment.")
+            if int(attempt.get("user_id") or 0) != int(user_id):
+                return await callback_query.message.reply("❌ This payment session belongs to another user.")
+
+            expires_at = float(attempt.get("expires_at") or 0)
+            if expires_at and _now_ts() > expires_at:
+                await payments_col.update_one(
+                    {"pay_ref": pay_ref},
+                    {"$set": {"status": "expired", "updated_at": _utc_now()}},
+                )
+                await _close_payment_session(pay_ref)
+                return await callback_query.message.reply(
+                    "⌛ Payment session expired (15 minutes).\n"
+                    "Please choose a plan again to generate a fresh payment.\n"
+                    "/premium"
+                )
+
+            payment_link_id = attempt.get("payment_link_id", "")
+            qr_code_id = attempt.get("qr_code_id", "")
+            plan_key = attempt.get("plan_key")
+            plan = PREMIUM_PLANS.get(plan_key) if plan_key else None
+            payment_id = ""
+            status = ""
+            if payment_link_id:
+                data = await _get_razorpay_payment_link(payment_link_id)
+                status = (data.get("status") or "").lower()
+                payment_id = data.get("payment_id") or ""
+
+            qr_paid = False
+            if qr_code_id and plan:
+                qr_data = await _get_razorpay_qr(qr_code_id)
+                received = int(qr_data.get("payments_amount_received") or 0)
+                payments_count = int(qr_data.get("payments_count") or 0)
+                expected_amount = int(plan["amount_inr"]) * 100
+                if received >= expected_amount or payments_count > 0:
+                    qr_paid = True
+                    if not payment_id:
+                        payments = qr_data.get("payments") or []
+                        if isinstance(payments, list) and payments:
+                            first_payment = payments[0] or {}
+                            payment_id = first_payment.get("id") or payment_id
+
+            paid_via_webhook = await payments_col.find_one(
+                {"pay_ref": pay_ref, "status": "paid"},
+                {"payment_id": 1, "plan_key": 1}
+            )
+
+            if status != "paid" and not qr_paid and not paid_via_webhook:
+                return await callback_query.message.reply(
+                    "❌ Payment not received yet.\n"
+                    "Please complete payment, wait 5-10 seconds, then tap ✅ I Have Paid again."
+                )
+
+            if paid_via_webhook and not payment_id:
+                payment_id = paid_via_webhook.get("payment_id") or ""
+                plan_key = paid_via_webhook.get("plan_key") or plan_key
+
+            already_done = False
+            if payment_id:
+                existing = await payments_col.find_one({"payment_id": payment_id, "status": "paid"}, {"_id": 1})
+                already_done = bool(existing)
+
             await payments_col.update_one(
                 {"pay_ref": pay_ref},
-                {"$set": {"status": "expired", "updated_at": _utc_now()}},
-            )
-            await _close_payment_session(pay_ref)
-            return await callback_query.message.reply(
-                "⌛ Payment session expired (15 minutes).\n"
-                "Please choose a plan again to generate a fresh payment.\n"
-                "/premium"
-            )
-
-        payment_link_id = attempt.get("payment_link_id", "")
-        qr_code_id = attempt.get("qr_code_id", "")
-        plan_key = attempt.get("plan_key")
-        plan = PREMIUM_PLANS.get(plan_key) if plan_key else None
-        payment_id = ""
-        status = ""
-        if payment_link_id:
-            data = await _get_razorpay_payment_link(payment_link_id)
-            status = (data.get("status") or "").lower()
-            payment_id = data.get("payment_id") or ""
-
-        qr_paid = False
-        if qr_code_id and plan:
-            qr_data = await _get_razorpay_qr(qr_code_id)
-            received = int(qr_data.get("payments_amount_received") or 0)
-            payments_count = int(qr_data.get("payments_count") or 0)
-            expected_amount = int(plan["amount_inr"]) * 100
-            if received >= expected_amount or payments_count > 0:
-                qr_paid = True
-                if not payment_id:
-                    payments = qr_data.get("payments") or []
-                    if isinstance(payments, list) and payments:
-                        first_payment = payments[0] or {}
-                        payment_id = first_payment.get("id") or payment_id
-
-        paid_via_webhook = await payments_col.find_one(
-            {"pay_ref": pay_ref, "status": "paid"},
-            {"payment_id": 1, "plan_key": 1}
-        )
-
-        if status != "paid" and not qr_paid and not paid_via_webhook:
-            return await callback_query.message.reply(
-                "❌ Payment not received yet.\n"
-                "Please complete payment, wait 5-10 seconds, then tap ✅ I Have Paid again."
+                {"$set": {
+                    "pay_ref": pay_ref,
+                    "payment_link_id": payment_link_id,
+                    "payment_id": payment_id,
+                    "user_id": int(user_id),
+                    "plan_key": plan_key,
+                    "status": "paid",
+                    "paid_at": _utc_now(),
+                    "source": "manual_check",
+                }},
+                upsert=True,
             )
 
-        if paid_via_webhook and not payment_id:
-            payment_id = paid_via_webhook.get("payment_id") or ""
-            plan_key = paid_via_webhook.get("plan_key") or plan_key
-
-        already_done = False
-        if payment_id:
-            existing = await payments_col.find_one({"payment_id": payment_id, "status": "paid"}, {"_id": 1})
-            already_done = bool(existing)
-
-        await payments_col.update_one(
-            {"pay_ref": pay_ref},
-            {"$set": {
-                "pay_ref": pay_ref,
-                "payment_link_id": payment_link_id,
-                "payment_id": payment_id,
-                "user_id": int(user_id),
-                "plan_key": plan_key,
-                "status": "paid",
-                "paid_at": _utc_now(),
-                "source": "manual_check",
-            }},
-            upsert=True,
-        )
-
-        if not already_done and plan_key in PREMIUM_PLANS:
-            result_text = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
-            await _close_payment_session(pay_ref)
-            await callback_query.message.reply(result_text)
-            await _notify_purchase(client, user_id, plan_key, payment_id=payment_id, source="manual_check")
-        else:
-            await _close_payment_session(pay_ref)
-            await callback_query.message.reply("✅ Payment already processed.")
+            if not already_done and plan_key in PREMIUM_PLANS:
+                result_text, was_new = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
+                await _close_payment_session(pay_ref)
+                await callback_query.message.reply(result_text)
+                if was_new:
+                    await _notify_purchase(client, user_id, plan_key, payment_id=payment_id, source="manual_check")
+            else:
+                await _close_payment_session(pay_ref)
+                await callback_query.message.reply("✅ Payment already processed.")
     except Exception as e:
         await report_error(client, "check_pay_cb", e, extra={"user_id": user_id, "pay_ref": pay_ref})
         await callback_query.message.reply("❌ Could not verify payment right now. Please try again shortly.")
@@ -3983,7 +4023,7 @@ async def premium_verify():
 
     user_id = int(token_data["user_id"])
     plan_key = token_data["plan_key"]
-    result_text = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
+    result_text, was_new = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
 
     if payments_col is not None:
         await payments_col.update_one(
@@ -4004,7 +4044,8 @@ async def premium_verify():
         await app.send_message(user_id, result_text)
     except Exception:
         pass
-    await _notify_purchase(app, user_id, plan_key, payment_id=payment_id, source="checkout_verify")
+    if was_new:
+        await _notify_purchase(app, user_id, plan_key, payment_id=payment_id, source="checkout_verify")
     return {"ok": True, "message": result_text}
 
 
@@ -4105,7 +4146,7 @@ async def razorpay_webhook():
         already_done = bool(existing)
 
     if user_id and plan_key in PREMIUM_PLANS and not already_done:
-        result_text = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
+        result_text, was_new = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
         if pay_ref:
             await _close_payment_session(pay_ref)
         if payments_col is not None:
@@ -4131,7 +4172,8 @@ async def razorpay_webhook():
             await app.send_message(user_id, result_text)
         except Exception:
             pass
-        await _notify_purchase(app, user_id, plan_key, payment_id=payment_id, source=f"webhook:{event}")
+        if was_new:
+            await _notify_purchase(app, user_id, plan_key, payment_id=payment_id, source=f"webhook:{event}")
     return {"ok": True}
 
 
