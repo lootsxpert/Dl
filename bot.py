@@ -362,11 +362,13 @@ async def _get_quota_state(user_id: int, daily_limit: int) -> dict:
 async def _apply_premium_plan(user_id: int, plan_key: str, payment_id: str = "") -> datetime:
     plan = PREMIUM_PLANS[plan_key]
     now = _utc_now()
-    # Reset from "now" instead of stacking on top of an active premium
-    # so re-clicking "I have paid" or duplicate webhook deliveries do not
-    # extend days beyond what the user actually paid for. The caller
-    # (_apply_purchase) is responsible for the active-premium short-circuit.
-    new_until = now + timedelta(days=plan["days"])
+    # Stack on top of any active premium so a new plan purchase extends
+    # the existing expiry. Dedup of duplicate Razorpay payment_ids is
+    # the caller's responsibility (per-user lock + payment_id check),
+    # so this stack will only ever run once per real payment.
+    current = await _get_premium_until(user_id)
+    base = current if current and current > now else now
+    new_until = base + timedelta(days=plan["days"])
     if users_col is not None:
         await users_col.update_one(
             {"user_id": int(user_id)},
