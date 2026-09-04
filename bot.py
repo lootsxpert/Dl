@@ -188,6 +188,8 @@ _force_sub_warned = False
 _broadcast_jobs: dict[str, dict] = {}
 # transfer job_id -> {"cancel": asyncio.Event, "user_id": int}
 _file_transfer_jobs: dict[str, dict] = {}
+# /gift flow: admin_id -> {"scope": "all"|"user", "target": int|None, "days": int, "step": str}
+_gift_flow: dict[int, dict] = {}
 
 def _env_flag(name: str, default: bool) -> bool:
     """Read a boolean env var, falling back to `default` when unset/blank."""
@@ -202,6 +204,7 @@ def _env_flag(name: str, default: bool) -> bool:
 # every restart or deploy, so the startup state comes from these env vars.
 FREE_MODE_ENABLED = _env_flag("FREE_MODE_ENABLED", False)  # /freemode_on|off - when True, bot is free for everyone
 SENDFILE_ENABLED = _env_flag("SENDFILE_ENABLED", False)  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
+MAINTENANCE_MODE = _env_flag("MAINTENANCE_MODE", False)  # /maintenance_on|off - when True, all non-admin users get the maintenance reply
 
 # In-memory per-API usage/health counters (not persisted; reset on restart).
 # api_key -> {attempts, success, fail, consecutive_fails, last_ok_at, last_fail_at, last_error}
@@ -383,6 +386,33 @@ async def _apply_premium_plan(user_id: int, plan_key: str, payment_id: str = "")
             }},
             upsert=True,
         )
+    return new_until
+
+
+async def _apply_gift_days(user_id: int, days: int) -> datetime | None:
+    """Extend premium_until by `days` for one user. Used by /gift.
+    Days is signed (positive = add, negative = subtract) so admin can also
+    shorten premium via the same flow if needed. Returns the new until, or
+    None if DB unavailable.
+    """
+    if users_col is None:
+        return None
+    now = _utc_now()
+    current = await _get_premium_until(user_id)
+    base = current if current and current > now else now
+    new_until = base + timedelta(days=int(days))
+    await users_col.update_one(
+        {"user_id": int(user_id)},
+        {"$set": {
+            "user_id": int(user_id),
+            "premium_until": new_until,
+            "updated_at": now,
+            "last_plan": "gift",
+            "premium_reminders": {},
+            "premium_tracking_enabled": True,
+        }},
+        upsert=True,
+    )
     return new_until
 
 
@@ -3094,6 +3124,251 @@ async def freemode_off_cmd(client, message):
     await message.reply("✅ Free mode DISABLED. Normal quota/premium rules apply again.")
 
 
+# ----- /maintenance_on|off -----
+@app.on_message(filters.command("maintenance_on"))
+async def maintenance_on_cmd(client, message):
+    global MAINTENANCE_MODE
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    MAINTENANCE_MODE = True
+    await message.reply("🛠 Maintenance mode ENABLED. All non-admin users will get the maintenance message.")
+    await _notify_admin(client, f"🛠 Maintenance mode ENABLED by admin {user_id}.")
+
+
+@app.on_message(filters.command("maintenance_off"))
+async def maintenance_off_cmd(client, message):
+    global MAINTENANCE_MODE
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    MAINTENANCE_MODE = False
+    await message.reply("✅ Maintenance mode DISABLED. Bot is back to normal.")
+    await _notify_admin(client, f"✅ Maintenance mode DISABLED by admin {user_id}.")
+
+
+# ----- /gift: grant premium to all users or a specific user (admin only) -----
+@app.on_message(filters.command("gift"))
+async def gift_cmd(client, message):
+    """Admin-only. Two flows: extend everyone (mass compensation during downtime)
+    or extend one user (by forwarded message, @username, or numeric user_id).
+    """
+    user_id = int(message.from_user.id)
+    if user_id not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    _gift_flow.pop(user_id, None)
+    await message.reply(
+        "🎁 <b>Gift premium</b>\n\n"
+        "Who do you want to grant premium to?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 All users", callback_data="gift:all")],
+            [InlineKeyboardButton("👤 Specific user", callback_data="gift:user")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="gift:cancel")],
+        ]),
+    )
+
+
+@app.on_callback_query(filters.regex(r"^gift:(all|user|confirm|cancel)$"))
+async def gift_cb(client, callback_query):
+    user_id = int(callback_query.from_user.id)
+    if user_id not in ADMIN_USER_IDS:
+        return await callback_query.answer("❌ Not allowed.", show_alert=True)
+    action = callback_query.data.split(":", 1)[1]
+
+    if action == "cancel":
+        _gift_flow.pop(user_id, None)
+        try:
+            await callback_query.message.edit("❌ Gift cancelled.")
+        except Exception:
+            pass
+        return await callback_query.answer()
+
+    if action == "all":
+        _gift_flow[user_id] = {"scope": "all", "step": "days"}
+        try:
+            await callback_query.message.edit(
+                "🌐 Extending premium for <b>all users</b>.\n\n"
+                "How many days do you want to add? (use a negative number to subtract)\n"
+                "Reply to this message with the number.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        await client.send_message(
+            callback_query.message.chat.id,
+            "Enter number of days:",
+            reply_markup=ForceReply(selective=True, placeholder="e.g. 7"),
+        )
+        return await callback_query.answer()
+
+    if action == "user":
+        _gift_flow[user_id] = {"scope": "user", "step": "target", "target": None}
+        try:
+            await callback_query.message.edit(
+                "👤 Granting premium to a <b>specific user</b>.\n\n"
+                "Forward any message from that user, OR send their "
+                "<code>@username</code>, OR send their numeric <code>user_id</code>.\n"
+                "Reply to this message.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        await client.send_message(
+            callback_query.message.chat.id,
+            "Send a forwarded message, @username, or numeric user_id:",
+            reply_markup=ForceReply(selective=True, placeholder="@username or user_id or forward"),
+        )
+        return await callback_query.answer()
+
+    if action == "confirm":
+        flow = _gift_flow.get(user_id)
+        if not flow or flow.get("step") != "confirm":
+            return await callback_query.answer("Nothing to confirm.", show_alert=True)
+        days = int(flow.get("days", 0))
+        if days == 0:
+            _gift_flow.pop(user_id, None)
+            return await callback_query.answer("Days cannot be zero.", show_alert=True)
+
+        if flow["scope"] == "all":
+            if users_col is None:
+                return await callback_query.answer("DB not configured.", show_alert=True)
+            cursor = users_col.find({}, {"user_id": 1})
+            updated = 0
+            async for doc in cursor:
+                uid = doc.get("user_id")
+                if not isinstance(uid, int):
+                    continue
+                await _apply_gift_days(uid, days)
+                updated += 1
+            _gift_flow.pop(user_id, None)
+            await _notify_admin(
+                client,
+                f"🎁 /gift (all): {days:+d} days applied to {updated} users.",
+            )
+            try:
+                await callback_query.message.edit(
+                    f"✅ Done. Applied {days:+d} days to {updated} users."
+                )
+            except Exception:
+                pass
+            return await callback_query.answer("Done.")
+
+        if flow["scope"] == "user":
+            target = int(flow.get("target") or 0)
+            if not target:
+                return await callback_query.answer("No target user.", show_alert=True)
+            new_until = await _apply_gift_days(target, days)
+            _gift_flow.pop(user_id, None)
+            target_label = await _get_user_display_name(client, target)
+            await _notify_admin(
+                client,
+                f"🎁 /gift: {days:+d} days applied to user {target} ({target_label}).",
+            )
+            try:
+                if new_until:
+                    sign = "+" if days >= 0 else ""
+                    await client.send_message(
+                        target,
+                        f"🎁 You received {sign}{days} days of premium!\n"
+                        f"Active until: {new_until.strftime('%Y-%m-%d %H:%M UTC')}",
+                    )
+            except Exception:
+                pass
+            try:
+                await callback_query.message.edit(
+                    f"✅ Done. {days:+d} days applied to {target_label} "
+                    f"(<code>{target}</code>).\n"
+                    f"New expiry: "
+                    + (new_until.strftime('%Y-%m-%d %H:%M UTC') if new_until else "n/a")
+                )
+            except Exception:
+                pass
+            return await callback_query.answer("Done.")
+
+
+async def _resolve_gift_target(client: Client, replied) -> tuple[int | None, str | None]:
+    """Resolve a target user_id from either a forwarded message, a @username,
+    or a numeric user_id string. Returns (user_id, error)."""
+    if replied and getattr(replied, "from_user", None):
+        return int(replied.from_user.id), None
+    text = (getattr(replied, "text", None) or getattr(replied, "caption", None) or "").strip()
+    if not text:
+        return None, "Send a forwarded message, @username, or numeric user_id."
+    handle = text.lstrip("@").strip()
+    if handle.lstrip("-").isdigit():
+        return int(handle), None
+    try:
+        u = await client.get_users(handle)
+        if u and u.id:
+            return int(u.id), None
+    except Exception:
+        pass
+    return None, f"Could not resolve user '{text}'. Send a forwarded message, @username, or numeric user_id."
+
+
+@app.on_message(filters.private & filters.reply)
+async def gift_flow_handler(client, message):
+    """Drives the /gift follow-up. Only fires for admins who are mid-flow and
+    replied (via ForceReply) to one of our prompts."""
+    user_id = int(message.from_user.id or 0)
+    if user_id not in ADMIN_USER_IDS:
+        return
+    flow = _gift_flow.get(user_id)
+    if not flow:
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        return
+    if message.reply_to_message.from_user.id != (await client.get_me()).id:
+        return
+
+    if flow.get("scope") == "user" and flow.get("step") == "target":
+        target_id, err = await _resolve_gift_target(client, message.reply_to_message or message)
+        if not target_id:
+            return await message.reply(f"❌ {err}")
+        flow["target"] = target_id
+        flow["step"] = "days"
+        await message.reply(
+            f"✅ Target resolved: <code>{target_id}</code>\n\n"
+            f"How many days? (negative to subtract)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True, placeholder="e.g. 7"),
+        )
+        return
+
+    if flow.get("step") == "days":
+        text = (message.text or "").strip()
+        try:
+            days = int(float(text))
+        except Exception:
+            return await message.reply("❌ Please reply with a number (e.g. <code>7</code> or <code>-3</code>).",
+                                        parse_mode=ParseMode.HTML)
+        if days == 0:
+            return await message.reply("❌ Days cannot be zero.")
+        flow["days"] = days
+        flow["step"] = "confirm"
+        if flow["scope"] == "all":
+            body = (
+                f"🌐 Confirm: extend premium by <b>{days:+d} days</b> for <b>all users</b>?\n\n"
+                f"This affects every user with a profile. Run again to undo by entering "
+                f"<code>{-days}</code> days."
+            )
+        else:
+            body = (
+                f"👤 Confirm: extend premium by <b>{days:+d} days</b> for "
+                f"user <code>{flow.get('target')}</code>?"
+            )
+        await message.reply(
+            body,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm", callback_data="gift:confirm")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="gift:cancel")],
+            ]),
+        )
+        return
+
+
 # ----- /sendfile_on|off -----
 @app.on_message(filters.command("sendfile_on"))
 async def sendfile_on_cmd(client, message):
@@ -3266,6 +3541,14 @@ async def usage_cmd(client, message):
     "sendfile_on", "sendfile_off", "refer",
 ]))
 async def diskwala(client, message):
+    if MAINTENANCE_MODE and int(getattr(message.from_user, "id", 0) or 0) not in ADMIN_USER_IDS:
+        return await message.reply(
+            "🛠 Bot is temporarily down for maintenance.\n\n"
+            "Will be up in a few minutes. Join @botsxp for updates.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Join @botsxp", url="https://t.me/botsxp")],
+            ]),
+        )
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
 
