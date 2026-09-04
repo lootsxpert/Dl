@@ -1630,7 +1630,7 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 
-async def reserve_credit(user_id: int) -> tuple[bool, bool, int]:
+async def reserve_credit(user_id: int, force_premium: bool = False) -> tuple[bool, bool, int]:
     """
     Atomically reserve 1 credit for this user.
     If API fails later, call refund_reserved_credit().
@@ -1638,8 +1638,12 @@ async def reserve_credit(user_id: int) -> tuple[bool, bool, int]:
     Bonus quota (permanent, e.g. from referrals) is consumed first, then
     the daily remaining counter. So a user with 50 bonus + 0 daily gets
     50 more downloads on top of tomorrow's daily reset.
+
+    `force_premium=True` treats the user as premium for the daily limit
+    (50/day) without granting real premium — used by free mode so users
+    still hit a quota wall instead of getting unlimited downloads.
     """
-    is_premium = await _is_premium_user(user_id)
+    is_premium = force_premium or await _is_premium_user(user_id)
     daily_limit = PREMIUM_DAILY_DOWNLOADS if is_premium else LIMIT_FREE_REQUESTS
     lock = _get_user_lock(user_id)
     async with lock:
@@ -1697,7 +1701,10 @@ async def _get_plan_text_and_markup(user_id: int) -> tuple[str, InlineKeyboardMa
     daily_limit = PREMIUM_DAILY_DOWNLOADS if is_premium else LIMIT_FREE_REQUESTS
     state = await _get_quota_state(user_id, daily_limit=daily_limit)
     remaining = int(state.get("remaining", 0))
-    freemode_note = "\n\n🎉 Free mode is activated by admin temporarily for all users. Enjoy!" if FREE_MODE_ENABLED else ""
+    freemode_note = (
+        f"\n\n🎉 Free mode is active: everyone gets the {PREMIUM_DAILY_DOWNLOADS}/day premium quota until admin turns it off."
+        if FREE_MODE_ENABLED else ""
+    )
     if is_premium:
         text = (
             "Your Account Details:\n"
@@ -3111,7 +3118,10 @@ async def freemode_on_cmd(client, message):
     if int(user_id) not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
     FREE_MODE_ENABLED = True
-    await message.reply("✅ Free mode ENABLED. Bot is free for all users until turned off.")
+    await message.reply(
+        "✅ Free mode ENABLED. All users get the premium daily quota "
+        f"({PREMIUM_DAILY_DOWNLOADS}/day) until turned off. Quota still applies."
+    )
 
 
 @app.on_message(filters.command("freemode_off"))
@@ -3162,6 +3172,7 @@ async def gift_cmd(client, message):
         "Who do you want to grant premium to?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 All current premium", callback_data="gift:premium")],
             [InlineKeyboardButton("🌐 All users", callback_data="gift:all")],
             [InlineKeyboardButton("👤 Specific user", callback_data="gift:user")],
             [InlineKeyboardButton("❌ Cancel", callback_data="gift:cancel")],
@@ -3169,7 +3180,7 @@ async def gift_cmd(client, message):
     )
 
 
-@app.on_callback_query(filters.regex(r"^gift:(all|user|confirm|cancel)$"))
+@app.on_callback_query(filters.regex(r"^gift:(all|premium|user|confirm|cancel)$"))
 async def gift_cb(client, callback_query):
     user_id = int(callback_query.from_user.id)
     if user_id not in ADMIN_USER_IDS:
@@ -3182,6 +3193,24 @@ async def gift_cb(client, callback_query):
             await callback_query.message.edit("❌ Gift cancelled.")
         except Exception:
             pass
+        return await callback_query.answer()
+
+    if action == "premium":
+        _gift_flow[user_id] = {"scope": "premium", "step": "days"}
+        try:
+            await callback_query.message.edit(
+                "💎 Extending premium for <b>all currently active premium users</b>.\n\n"
+                "How many days do you want to add? (use a negative number to subtract)\n"
+                "Reply to this message with the number.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        await client.send_message(
+            callback_query.message.chat.id,
+            "Enter number of days:",
+            reply_markup=ForceReply(selective=True, placeholder="e.g. 7"),
+        )
         return await callback_query.answer()
 
     if action == "all":
@@ -3249,6 +3278,34 @@ async def gift_cb(client, callback_query):
             try:
                 await callback_query.message.edit(
                     f"✅ Done. Applied {days:+d} days to {updated} users."
+                )
+            except Exception:
+                pass
+            return await callback_query.answer("Done.")
+
+        if flow["scope"] == "premium":
+            if users_col is None:
+                return await callback_query.answer("DB not configured.", show_alert=True)
+            now = _utc_now()
+            cursor = users_col.find(
+                {"premium_until": {"$gt": now}},
+                {"user_id": 1, "premium_until": 1},
+            )
+            updated = 0
+            async for doc in cursor:
+                uid = doc.get("user_id")
+                if not isinstance(uid, int):
+                    continue
+                await _apply_gift_days(uid, days)
+                updated += 1
+            _gift_flow.pop(user_id, None)
+            await _notify_admin(
+                client,
+                f"🎁 /gift (premium): {days:+d} days applied to {updated} active premium users.",
+            )
+            try:
+                await callback_query.message.edit(
+                    f"✅ Done. Applied {days:+d} days to {updated} currently active premium users."
                 )
             except Exception:
                 pass
@@ -3351,6 +3408,13 @@ async def gift_flow_handler(client, message):
             body = (
                 f"🌐 Confirm: extend premium by <b>{days:+d} days</b> for <b>all users</b>?\n\n"
                 f"This affects every user with a profile. Run again to undo by entering "
+                f"<code>{-days}</code> days."
+            )
+        elif flow["scope"] == "premium":
+            body = (
+                f"💎 Confirm: extend premium by <b>{days:+d} days</b> for "
+                f"<b>all currently active premium users</b>?\n\n"
+                f"Users with no active premium are skipped. Run again to undo by entering "
                 f"<code>{-days}</code> days."
             )
         else:
@@ -3584,9 +3648,11 @@ async def diskwala(client, message):
             return
 
         for idx, url in enumerate(diskwala_urls[:MAX_LINKS_PER_MESSAGE], start=1):
-            skip_quota = FREE_MODE_ENABLED
-            if skip_quota:
-                ok_credit, is_premium, daily_limit = True, True, 0
+            if FREE_MODE_ENABLED:
+                # Free mode: still consume a credit slot so the user can't burn
+                # unlimited downloads, but treat them as premium (50/day cap)
+                # so they get the higher daily limit.
+                ok_credit, is_premium, daily_limit = await reserve_credit(user_id, force_premium=True)
             else:
                 ok_credit, is_premium, daily_limit = await reserve_credit(user_id)
             if not ok_credit:
@@ -3619,8 +3685,8 @@ async def diskwala(client, message):
                         f"Failed ❌\n\n{err_msg}",
                         reply_markup=_support_markup(),
                     )
-                if not skip_quota:
-                    await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
+                # refund reserved credit because request didn't succeed
+                await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
                 continue
 
             name = result["name"]
