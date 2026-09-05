@@ -1833,16 +1833,40 @@ async def _broadcast_send_one(
     """
     try:
         if src_message_id is not None:
-            await client.copy_message(
-                chat_id=target_id,
-                from_chat_id=admin_chat_id,
-                message_id=src_message_id,
-                caption=payload_text or None,
-                # Drop the source's inline buttons — they often reference URLs
-                # that the bot can't legitimately send to other users
-                # (BUTTON_URL_INVALID / CHAT_SEND_INLINE_FORBIDDEN).
-                reply_markup=None,
-            )
+            # Re-fetch and re-send by file_id. Bypasses copyMessage's
+            # restrictions on inline buttons (BUTTON_URL_INVALID,
+            # CHAT_SEND_INLINE_FORBIDDEN) and works for all media types
+            # plus text-only sources.
+            src_msg = await client.get_messages(admin_chat_id, src_message_id)
+            if src_msg is None:
+                return "failed"
+            caption = payload_text or src_msg.caption or src_msg.text or None
+            if src_msg.photo:
+                await client.send_photo(target_id, src_msg.photo.file_id, caption=caption)
+                return "sent"
+            if src_msg.video:
+                await client.send_video(target_id, src_msg.video.file_id, caption=caption)
+                return "sent"
+            if src_msg.document:
+                await client.send_document(target_id, src_msg.document.file_id, caption=caption)
+                return "sent"
+            if src_msg.animation:
+                await client.send_animation(target_id, src_msg.animation.file_id, caption=caption)
+                return "sent"
+            if src_msg.audio:
+                await client.send_audio(target_id, src_msg.audio.file_id, caption=caption)
+                return "sent"
+            if src_msg.voice:
+                await client.send_voice(target_id, src_msg.voice.file_id, caption=caption)
+                return "sent"
+            if src_msg.sticker:
+                await client.send_sticker(target_id, src_msg.sticker.file_id)
+                return "sent"
+            text = src_msg.text or src_msg.caption or payload_text
+            if text:
+                await client.send_message(target_id, text)
+                return "sent"
+            return "failed"
         else:
             await client.send_message(target_id, payload_text)
         return "sent"
@@ -1879,48 +1903,6 @@ async def _broadcast_send_one(
             )
         except Exception:
             pass
-        # Fallback: re-fetch the source and re-send the underlying media
-        # using its file_id. Recovers from copyMessage failures caused by
-        # inline buttons or other restrictions while preserving media + caption.
-        if src_message_id is not None:
-            try:
-                src_msg = await client.get_messages(admin_chat_id, src_message_id)
-                caption = payload_text or (src_msg.caption or src_msg.text or "") or None
-                if src_msg.photo:
-                    await client.send_photo(target_id, src_msg.photo.file_id, caption=caption)
-                    return "sent"
-                if src_msg.video:
-                    await client.send_video(target_id, src_msg.video.file_id, caption=caption)
-                    return "sent"
-                if src_msg.document:
-                    await client.send_document(target_id, src_msg.document.file_id, caption=caption)
-                    return "sent"
-                if src_msg.animation:
-                    await client.send_animation(target_id, src_msg.animation.file_id, caption=caption)
-                    return "sent"
-                if src_msg.audio:
-                    await client.send_audio(target_id, src_msg.audio.file_id, caption=caption)
-                    return "sent"
-                if src_msg.voice:
-                    await client.send_voice(target_id, src_msg.voice.file_id, caption=caption)
-                    return "sent"
-                if src_msg.sticker:
-                    await client.send_sticker(target_id, src_msg.sticker.file_id)
-                    return "sent"
-                text = src_msg.text or src_msg.caption or payload_text
-                if text:
-                    await client.send_message(target_id, text)
-                    return "sent"
-            except Exception as fallback_err:
-                try:
-                    await report_error(
-                        client,
-                        "broadcast_send_one_fallback",
-                        fallback_err,
-                        extra={"target_id": int(target_id)},
-                    )
-                except Exception:
-                    pass
         if payload_text:
             try:
                 await client.send_message(target_id, payload_text)
@@ -3539,6 +3521,18 @@ async def broadcast_cmd(client, message):
         payload_text = command_text.split(" ", 1)[1].strip()
 
     src = message.reply_to_message
+    # Debug: log exactly what we received so silent failures are diagnosable.
+    try:
+        await _notify_admin(
+            client,
+            f"📣 broadcast received: payload_len={len(payload_text)} "
+            f"reply_to={'yes' if src else 'no'} "
+            f"src_type={type(src).__name__ if src else 'None'} "
+            f"src_id={src.id if src else None} "
+            f"msg_id={message.id}",
+        )
+    except Exception:
+        pass
     if src is None and not payload_text:
         return await message.reply(
             "❌ Nothing to broadcast.\n\n"
