@@ -1838,6 +1838,10 @@ async def _broadcast_send_one(
                 from_chat_id=admin_chat_id,
                 message_id=src_message_id,
                 caption=payload_text or None,
+                # Drop the source's inline buttons — they often reference URLs
+                # that the bot can't legitimately send to other users
+                # (BUTTON_URL_INVALID / CHAT_SEND_INLINE_FORBIDDEN).
+                reply_markup=None,
             )
         else:
             await client.send_message(target_id, payload_text)
@@ -1861,7 +1865,68 @@ async def _broadcast_send_one(
     except PeerIdInvalid:
         await _remove_user_record(target_id, bot_key)
         return "removed"
-    except Exception:
+    except Exception as e:
+        try:
+            await report_error(
+                client,
+                "broadcast_send_one",
+                e,
+                extra={
+                    "target_id": int(target_id),
+                    "src_message_id": int(src_message_id) if src_message_id else None,
+                    "has_payload": bool(payload_text),
+                },
+            )
+        except Exception:
+            pass
+        # Fallback: re-fetch the source and re-send the underlying media
+        # using its file_id. Recovers from copyMessage failures caused by
+        # inline buttons or other restrictions while preserving media + caption.
+        if src_message_id is not None:
+            try:
+                src_msg = await client.get_messages(admin_chat_id, src_message_id)
+                caption = payload_text or (src_msg.caption or src_msg.text or "") or None
+                if src_msg.photo:
+                    await client.send_photo(target_id, src_msg.photo.file_id, caption=caption)
+                    return "sent"
+                if src_msg.video:
+                    await client.send_video(target_id, src_msg.video.file_id, caption=caption)
+                    return "sent"
+                if src_msg.document:
+                    await client.send_document(target_id, src_msg.document.file_id, caption=caption)
+                    return "sent"
+                if src_msg.animation:
+                    await client.send_animation(target_id, src_msg.animation.file_id, caption=caption)
+                    return "sent"
+                if src_msg.audio:
+                    await client.send_audio(target_id, src_msg.audio.file_id, caption=caption)
+                    return "sent"
+                if src_msg.voice:
+                    await client.send_voice(target_id, src_msg.voice.file_id, caption=caption)
+                    return "sent"
+                if src_msg.sticker:
+                    await client.send_sticker(target_id, src_msg.sticker.file_id)
+                    return "sent"
+                text = src_msg.text or src_msg.caption or payload_text
+                if text:
+                    await client.send_message(target_id, text)
+                    return "sent"
+            except Exception as fallback_err:
+                try:
+                    await report_error(
+                        client,
+                        "broadcast_send_one_fallback",
+                        fallback_err,
+                        extra={"target_id": int(target_id)},
+                    )
+                except Exception:
+                    pass
+        if payload_text:
+            try:
+                await client.send_message(target_id, payload_text)
+                return "sent"
+            except Exception:
+                pass
         return "failed"
 
 
@@ -3482,6 +3547,21 @@ async def broadcast_cmd(client, message):
             "2) Long-press a message → Reply → type `/broadcast` "
             "(copies that message, with optional new caption after the command)\n"
             "3) Long-press a media message → Reply → `/broadcast new caption`"
+        )
+
+    # If the source message has inline buttons (e.g. our own /start keyboard),
+    # copyMessage will fail with BUTTON_URL_INVALID / CHAT_SEND_INLINE_FORBIDDEN
+    # because bot-issued buttons reference URLs that can't be sent to other
+    # users. We always pass reply_markup=None to copyMessage, but some
+    # source buttons are deeply tied to the bot's inline query and copy
+    # still fails. In that case the per-target fallback in
+    # _broadcast_send_one re-sends the media + caption using the file_id,
+    # so the broadcast still works — just without the buttons. Notify the
+    # admin up front so they know to expect that.
+    if src is not None and getattr(src, "reply_markup", None) is not None:
+        await message.reply(
+            "ℹ️ Source has inline buttons — broadcasting without them "
+            "(buttons only work in the original chat). Media + caption preserved."
         )
 
     job_id = f"{int(_now_ts()):x}"[-8:]
