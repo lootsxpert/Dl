@@ -3476,10 +3476,12 @@ async def broadcast_cmd(client, message):
     src = message.reply_to_message
     if src is None and not payload_text:
         return await message.reply(
-            "Usage:\n"
-            "1) `/broadcast your text`\n"
-            "2) Reply to any media/text and send `/broadcast`\n"
-            "3) Reply to media and send `/broadcast your new caption`"
+            "❌ Nothing to broadcast.\n\n"
+            "Send one of:\n"
+            "1) `/broadcast your text here` (broadcasts plain text)\n"
+            "2) Long-press a message → Reply → type `/broadcast` "
+            "(copies that message, with optional new caption after the command)\n"
+            "3) Long-press a media message → Reply → `/broadcast new caption`"
         )
 
     job_id = f"{int(_now_ts()):x}"[-8:]
