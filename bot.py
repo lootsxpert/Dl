@@ -1838,8 +1838,27 @@ async def _broadcast_send_one(
     """
     try:
         if src_msg is not None:
-            # Build caption: admin override text takes priority over original.
-            # Use caption_html / text.html to preserve bold/italic/links/entities.
+            from_chat_id = src_msg.chat.id
+            msg_id = src_msg.id
+
+            override_caption = payload_text or None
+            override_parse_mode = ParseMode.MARKDOWN if override_caption else None
+
+            # --- Primary: copy_message (works for ALL media types & preserves original caption) ---
+            try:
+                await client.copy_message(
+                    chat_id=target_id,
+                    from_chat_id=from_chat_id,
+                    message_id=msg_id,
+                    caption=override_caption,
+                    parse_mode=override_parse_mode,
+                    reply_markup=None,
+                )
+                return "sent"
+            except Exception:
+                pass
+
+            # --- Fallback: per-type send using file_id ---
             if payload_text:
                 caption = payload_text
                 parse_mode = ParseMode.MARKDOWN
@@ -1850,7 +1869,7 @@ async def _broadcast_send_one(
             raw_text = getattr(src_msg, "text", None)
             text_html = (raw_text.html if hasattr(raw_text, "html") else str(raw_text)) if raw_text else None
 
-            if src_msg.photo:
+            if getattr(src_msg, "photo", None):
                 await client.send_photo(
                     target_id, src_msg.photo.file_id,
                     caption=caption, parse_mode=parse_mode,
@@ -3449,19 +3468,36 @@ async def _resolve_gift_target(client: Client, replied) -> tuple[int | None, str
     return None, f"Could not resolve user '{text}'. Send a forwarded message, @username, or numeric user_id."
 
 
-@app.on_message(filters.private & filters.reply)
+async def _gift_reply_filter(_, __, message):
+    if not message.from_user or not message.reply_to_message:
+        return False
+    text = (message.text or message.caption or "").strip()
+    if text.startswith("/"):
+        return False
+    return int(message.from_user.id) in _gift_flow
+
+
+_gift_reply = filters.create(_gift_reply_filter)
+
+
+@app.on_message(filters.private & filters.reply & _gift_reply)
 async def gift_flow_handler(client, message):
     """Drives the /gift follow-up. Only fires for admins who are mid-flow and
     replied (via ForceReply) to one of our prompts."""
     user_id = int(message.from_user.id or 0)
     if user_id not in ADMIN_USER_IDS:
+        message.continue_propagation()
         return
     flow = _gift_flow.get(user_id)
     if not flow:
+        message.continue_propagation()
         return
     if not message.reply_to_message or not message.reply_to_message.from_user:
+        message.continue_propagation()
         return
-    if message.reply_to_message.from_user.id != (await client.get_me()).id:
+    bot_me = await client.get_me()
+    if message.reply_to_message.from_user.id != bot_me.id:
+        message.continue_propagation()
         return
 
     if flow.get("scope") == "user" and flow.get("step") == "target":
