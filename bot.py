@@ -1841,37 +1841,72 @@ async def _broadcast_send_one(
             # CHAT_SEND_INLINE_FORBIDDEN) and works for all media types
             # plus text-only sources.
             src_msg = await client.get_messages(admin_chat_id, src_message_id)
-            if src_msg is None:
+            # Pyrogram returns an empty Message object (not None) when not found.
+            if src_msg is None or not getattr(src_msg, "id", None):
                 return "failed"
-            caption = payload_text or src_msg.caption or src_msg.text or None
+
+            # Build caption: admin override text takes priority.
+            # Use html-serialized text to preserve bold/italic/links/entities.
+            if payload_text:
+                caption = payload_text
+                parse_mode = ParseMode.MARKDOWN
+            else:
+                caption = src_msg.caption_html or src_msg.caption or None
+                parse_mode = ParseMode.HTML
+
+            text_html = src_msg.text.html if src_msg.text else None
+
             if src_msg.photo:
-                await client.send_photo(target_id, src_msg.photo.file_id, caption=caption)
+                await client.send_photo(
+                    target_id, src_msg.photo.file_id,
+                    caption=caption, parse_mode=parse_mode,
+                )
                 return "sent"
             if src_msg.video:
-                await client.send_video(target_id, src_msg.video.file_id, caption=caption)
+                await client.send_video(
+                    target_id, src_msg.video.file_id,
+                    caption=caption, parse_mode=parse_mode,
+                )
                 return "sent"
             if src_msg.document:
-                await client.send_document(target_id, src_msg.document.file_id, caption=caption)
+                await client.send_document(
+                    target_id, src_msg.document.file_id,
+                    caption=caption, parse_mode=parse_mode,
+                )
                 return "sent"
             if src_msg.animation:
-                await client.send_animation(target_id, src_msg.animation.file_id, caption=caption)
+                await client.send_animation(
+                    target_id, src_msg.animation.file_id,
+                    caption=caption, parse_mode=parse_mode,
+                )
                 return "sent"
             if src_msg.audio:
-                await client.send_audio(target_id, src_msg.audio.file_id, caption=caption)
+                await client.send_audio(
+                    target_id, src_msg.audio.file_id,
+                    caption=caption, parse_mode=parse_mode,
+                )
                 return "sent"
             if src_msg.voice:
-                await client.send_voice(target_id, src_msg.voice.file_id, caption=caption)
+                await client.send_voice(
+                    target_id, src_msg.voice.file_id,
+                    caption=caption, parse_mode=parse_mode,
+                )
                 return "sent"
             if src_msg.sticker:
                 await client.send_sticker(target_id, src_msg.sticker.file_id)
                 return "sent"
-            text = src_msg.text or src_msg.caption or payload_text
-            if text:
-                await client.send_message(target_id, text)
+            # Text-only message — preserve full HTML formatting
+            final_text = payload_text or text_html or src_msg.caption_html or src_msg.caption
+            if final_text:
+                await client.send_message(
+                    target_id, final_text,
+                    parse_mode=ParseMode.HTML if not payload_text else ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
                 return "sent"
             return "failed"
         else:
-            await client.send_message(target_id, payload_text)
+            await client.send_message(target_id, payload_text, disable_web_page_preview=True)
         return "sent"
     except FloodWait as e:
         await asyncio.sleep(float(e.value))
@@ -1906,13 +1941,7 @@ async def _broadcast_send_one(
             )
         except Exception:
             pass
-        if payload_text:
-            try:
-                await client.send_message(target_id, payload_text)
-                return "sent"
-            except Exception:
-                pass
-        return "failed"
+
 
 
 async def _broadcast_edit_status(client: Client, chat_id: int, message_id: int, text: str, markup=None) -> None:
