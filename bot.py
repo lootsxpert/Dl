@@ -523,6 +523,54 @@ async def _apply_purchase(user_id: int, plan_key: str, payment_id: str = "") -> 
     return "✅ Purchase processed.", False
 
 
+_TERMINAL_PAYMENT_SESSION_STATUSES = ("paid", "expired", "cancelled", "cancelled_replaced")
+
+
+async def _payment_id_already_fulfilled(payment_id: str, *, exclude_pay_ref: str = "") -> bool:
+    """True if this Razorpay payment_id already activated premium (any session)."""
+    if not payment_id or payments_col is None:
+        return False
+    query: dict = {"payment_id": payment_id, "status": "paid"}
+    if exclude_pay_ref:
+        query["pay_ref"] = {"$ne": exclude_pay_ref}
+    doc = await payments_col.find_one(query, {"_id": 1})
+    return bool(doc)
+
+
+async def _claim_payment_session(
+    pay_ref: str,
+    user_id: int,
+    plan_key: str,
+    payment_id: str,
+    source: str,
+    **extra_fields,
+) -> bool:
+    """Atomically mark a payment session paid. True only for the first successful claim."""
+    if payments_col is None or not pay_ref:
+        return True
+    if payment_id and await _payment_id_already_fulfilled(payment_id, exclude_pay_ref=pay_ref):
+        return False
+    set_fields = {
+        "pay_ref": pay_ref,
+        "user_id": int(user_id),
+        "plan_key": plan_key,
+        "status": "paid",
+        "paid_at": _utc_now(),
+        "source": source,
+        "payment_id": payment_id or "",
+        "updated_at": _utc_now(),
+        **extra_fields,
+    }
+    res = await payments_col.update_one(
+        {
+            "pay_ref": pay_ref,
+            "status": {"$nin": list(_TERMINAL_PAYMENT_SESSION_STATUSES)},
+        },
+        {"$set": set_fields},
+    )
+    return res.modified_count > 0
+
+
 def _format_user_name(user_obj=None, fallback: str = "") -> str:
     if user_obj is None:
         return fallback or "Unknown"
@@ -4358,27 +4406,17 @@ async def check_pay_cb(client, callback_query):
                 payment_id = paid_via_webhook.get("payment_id") or ""
                 plan_key = paid_via_webhook.get("plan_key") or plan_key
 
-            already_done = False
-            if payment_id:
-                existing = await payments_col.find_one({"payment_id": payment_id, "status": "paid"}, {"_id": 1})
-                already_done = bool(existing)
-
-            await payments_col.update_one(
-                {"pay_ref": pay_ref},
-                {"$set": {
-                    "pay_ref": pay_ref,
-                    "payment_link_id": payment_link_id,
-                    "payment_id": payment_id,
-                    "user_id": int(user_id),
-                    "plan_key": plan_key,
-                    "status": "paid",
-                    "paid_at": _utc_now(),
-                    "source": "manual_check",
-                }},
-                upsert=True,
+            claimed = await _claim_payment_session(
+                pay_ref,
+                user_id,
+                plan_key,
+                payment_id,
+                "manual_check",
+                payment_link_id=payment_link_id,
+                qr_code_id=qr_code_id,
             )
 
-            if not already_done and plan_key in PREMIUM_PLANS:
+            if claimed and plan_key in PREMIUM_PLANS:
                 result_text, was_new = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
                 await _close_payment_session(pay_ref)
                 await callback_query.message.reply(result_text)
@@ -4587,21 +4625,25 @@ async def premium_verify():
 
     user_id = int(token_data["user_id"])
     plan_key = token_data["plan_key"]
-    result_text, was_new = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
-
-    if payments_col is not None:
-        await payments_col.update_one(
-            {"order_id": order_id},
-            {"$set": {
-                "order_id": order_id,
-                "payment_id": payment_id,
-                "user_id": user_id,
-                "plan_key": plan_key,
-                "status": "paid",
-                "paid_at": _utc_now(),
-            }},
-            upsert=True,
-        )
+    async with _get_user_lock(user_id):
+        if payment_id and await _payment_id_already_fulfilled(payment_id):
+            payment_tokens.pop(pay_token, None)
+            return {"ok": True, "message": "Payment already processed."}
+        result_text, was_new = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
+        if payments_col is not None and payment_id:
+            await payments_col.update_one(
+                {"payment_id": payment_id},
+                {"$set": {
+                    "order_id": order_id,
+                    "payment_id": payment_id,
+                    "user_id": user_id,
+                    "plan_key": plan_key,
+                    "status": "paid",
+                    "paid_at": _utc_now(),
+                    "source": "checkout_verify",
+                }},
+                upsert=True,
+            )
 
     payment_tokens.pop(pay_token, None)
     try:
@@ -4694,46 +4736,36 @@ async def razorpay_webhook():
         return {"ok": True}
 
     session_status = (session_doc.get("status") or "").lower()
-    if session_status in ("paid", "expired", "cancelled", "cancelled_replaced"):
+    if session_status in _TERMINAL_PAYMENT_SESSION_STATUSES:
         return {"ok": True}
 
     # Always trust the stored session identity over webhook notes.
     user_id = int(session_doc.get("user_id") or 0)
     plan_key = session_doc.get("plan_key")
     pay_ref = session_doc.get("pay_ref") or pay_ref
-    if not user_id or plan_key not in PREMIUM_PLANS:
+    if not user_id or plan_key not in PREMIUM_PLANS or not pay_ref:
         return {"ok": True}
 
-    already_done = False
-    if payments_col is not None and payment_id:
-        existing = await payments_col.find_one({"payment_id": payment_id, "status": "paid"}, {"_id": 1})
-        already_done = bool(existing)
-
-    if user_id and plan_key in PREMIUM_PLANS and not already_done:
+    async with _get_user_lock(user_id):
+        if payment_id and await _payment_id_already_fulfilled(payment_id, exclude_pay_ref=pay_ref):
+            return {"ok": True}
+        claimed = await _claim_payment_session(
+            pay_ref,
+            user_id,
+            plan_key,
+            payment_id,
+            f"webhook:{event}",
+            order_id=order_id,
+            payment_link_id=payment_link_id,
+            qr_code_id=qr_code_id,
+        )
+        if not claimed:
+            return {"ok": True}
         result_text, was_new = await _apply_purchase(user_id, plan_key, payment_id=payment_id)
         if pay_ref:
             await _close_payment_session(pay_ref)
         if was_new:
             await _delete_payment_post_now(app, pay_ref or "")
-        if payments_col is not None:
-            record_key = pay_ref or (f"qr:{qr_code_id}" if qr_code_id else "") or (
-                        payment_id or f"plink:{payment_link_id}")
-            await payments_col.update_one(
-                {"pay_ref": record_key},
-                {"$set": {
-                    "pay_ref": pay_ref,
-                    "order_id": order_id,
-                    "payment_id": payment_id,
-                    "payment_link_id": payment_link_id,
-                    "qr_code_id": qr_code_id,
-                    "user_id": user_id,
-                    "plan_key": plan_key,
-                    "status": "paid",
-                    "paid_at": _utc_now(),
-                    "source": f"webhook:{event}",
-                }},
-                upsert=True,
-            )
         try:
             await app.send_message(user_id, result_text)
         except Exception:
@@ -5199,6 +5231,15 @@ async def before_serving():
         payments_col = mongo_db["payments"]
         referrals_col = mongo_db["referrals"]
         await users_col.create_index("bot_keys")
+        await payments_col.create_index(
+            "payment_id",
+            unique=True,
+            partialFilterExpression={
+                "status": "paid",
+                "payment_id": {"$type": "string", "$gt": ""},
+            },
+            name="uniq_paid_razorpay_payment_id",
+        )
     else:
         logger.warning("MongoDB not configured or motor missing; premium persistence disabled.")
     await app.start()
