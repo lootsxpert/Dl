@@ -424,21 +424,11 @@ async def _apply_quota_addon(user_id: int, plan_key: str) -> int:
     quota_add = int(plan.get("quota_add", 0))
     if quota_add <= 0:
         return 0
-    is_premium = await _is_premium_user(user_id)
-    daily_limit = PREMIUM_DAILY_DOWNLOADS if is_premium else LIMIT_FREE_REQUESTS
-    lock = _get_user_lock(user_id)
-    async with lock:
-        state = await _get_quota_state(user_id, daily_limit=daily_limit)
-        new_remaining = int(state.get("remaining", 0)) + quota_add
-        if users_col is None:
-            state["remaining"] = new_remaining
-            user_data[user_id] = state
-        else:
-            await users_col.update_one(
-                {"user_id": int(user_id)},
-                {"$set": {"quota.remaining": new_remaining, "updated_at": _utc_now()}},
-                upsert=True,
-            )
+    if users_col is None:
+        user = user_data.setdefault(user_id, {})
+        user["bonus_quota"] = int(user.get("bonus_quota", 0)) + quota_add
+        return quota_add
+    await _add_bonus_quota(user_id, quota_add)
     return quota_add
 
 
@@ -453,7 +443,7 @@ REFERRAL_BONUS_EVERY_N = 5   # Award bonus every N confirmed referrals (5 = each
 
 async def _get_bonus_quota(user_id: int) -> int:
     if users_col is None:
-        return 0
+        return int((user_data.get(user_id) or {}).get("bonus_quota", 0))
     doc = await users_col.find_one({"user_id": int(user_id)}, {"bonus_quota": 1})
     return int((doc or {}).get("bonus_quota") or 0)
 
@@ -519,7 +509,8 @@ async def _apply_purchase(user_id: int, plan_key: str, payment_id: str = "") -> 
         return f"✅ Premium activated till {until.strftime('%Y-%m-%d %H:%M UTC')}", True
     if int(plan.get("quota_add", 0)) > 0:
         added = await _apply_quota_addon(user_id, plan_key)
-        return f"✅ Quota top-up successful. Added +{added} downloads for today.", True
+        total_bonus = await _get_bonus_quota(user_id)
+        return f"✅ Quota top-up successful! Added +{added} downloads to your profile. (Total Extra Quota: {total_bonus})", True
     return "✅ Purchase processed.", False
 
 
@@ -1752,6 +1743,8 @@ async def _get_plan_text_and_markup(user_id: int) -> tuple[str, InlineKeyboardMa
     daily_limit = PREMIUM_DAILY_DOWNLOADS if is_premium else LIMIT_FREE_REQUESTS
     state = await _get_quota_state(user_id, daily_limit=daily_limit)
     remaining = int(state.get("remaining", 0))
+    bonus = await _get_bonus_quota(user_id)
+    bonus_line = f"\nExtra Quota : {bonus} Remaining" if bonus > 0 else ""
     freemode_note = (
         f"\n\n🎉 Free mode is active: everyone gets the {PREMIUM_DAILY_DOWNLOADS}/day premium quota until admin turns it off."
         if FREE_MODE_ENABLED else ""
@@ -1761,6 +1754,7 @@ async def _get_plan_text_and_markup(user_id: int) -> tuple[str, InlineKeyboardMa
             "Your Account Details:\n"
             "Premium Member : ✅\n"
             f"todays limit : {remaining} Remaining"
+            f"{bonus_line}"
             f"{freemode_note}"
         )
         markup = InlineKeyboardMarkup([
@@ -1772,6 +1766,7 @@ async def _get_plan_text_and_markup(user_id: int) -> tuple[str, InlineKeyboardMa
         "Your Account Details:\n"
         "Premium Member : ❌\n"
         f"Free Downloads : Remaining {remaining}/{daily_limit} downloads"
+        f"{bonus_line}"
         f"{freemode_note}"
     )
     return text, None
@@ -4346,6 +4341,15 @@ async def check_pay_cb(client, callback_query):
             # what happened.
             if (attempt.get("status") or "").lower() == "paid":
                 await _close_payment_session(pay_ref)
+                plan_key = attempt.get("plan_key")
+                plan = PREMIUM_PLANS.get(plan_key) if plan_key else None
+                if plan and plan.get("quota_add", 0) > 0:
+                    bonus = await _get_bonus_quota(user_id)
+                    return await callback_query.message.reply(
+                        f"✅ Payment already processed.\n"
+                        f"Quota top-up of +{plan['quota_add']} downloads added to your profile.\n"
+                        f"Total Extra Quota: {bonus}"
+                    )
                 current_premium = await _get_premium_until(user_id)
                 if current_premium and current_premium > _utc_now():
                     extra = f"\nYour premium is active till {current_premium.strftime('%Y-%m-%d %H:%M UTC')}."
@@ -4425,6 +4429,14 @@ async def check_pay_cb(client, callback_query):
                     await _notify_purchase(client, user_id, plan_key, payment_id=payment_id, source="manual_check")
             else:
                 await _close_payment_session(pay_ref)
+                plan = PREMIUM_PLANS.get(plan_key) if plan_key else None
+                if plan and plan.get("quota_add", 0) > 0:
+                    bonus = await _get_bonus_quota(user_id)
+                    return await callback_query.message.reply(
+                        f"✅ Payment already processed.\n"
+                        f"Quota top-up of +{plan['quota_add']} downloads added to your profile.\n"
+                        f"Total Extra Quota: {bonus}"
+                    )
                 current_premium = await _get_premium_until(user_id)
                 if current_premium and current_premium > _utc_now():
                     extra = f"\nYour premium is active till {current_premium.strftime('%Y-%m-%d %H:%M UTC')}."
