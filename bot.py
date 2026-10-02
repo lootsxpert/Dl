@@ -1749,10 +1749,16 @@ async def _get_plan_text_and_markup(user_id: int) -> tuple[str, InlineKeyboardMa
         f"\n\n🎉 Free mode is active: everyone gets the {PREMIUM_DAILY_DOWNLOADS}/day premium quota until admin turns it off."
         if FREE_MODE_ENABLED else ""
     )
+    premium_until = await _get_premium_until(user_id)
     if is_premium:
+        until_line = (
+            f"\nPremium Valid Until : {premium_until.strftime('%Y-%m-%d %H:%M UTC')}"
+            if premium_until else ""
+        )
         text = (
             "Your Account Details:\n"
-            "Premium Member : ✅\n"
+            "Premium Member : ✅"
+            f"{until_line}\n"
             f"todays limit : {remaining} Remaining"
             f"{bonus_line}"
             f"{freemode_note}"
@@ -1762,9 +1768,14 @@ async def _get_plan_text_and_markup(user_id: int) -> tuple[str, InlineKeyboardMa
         ])
         return text, markup
 
+    expired_line = (
+        f"\nPremium Expired On : {premium_until.strftime('%Y-%m-%d %H:%M UTC')}"
+        if premium_until and premium_until <= _utc_now() else ""
+    )
     text = (
         "Your Account Details:\n"
-        "Premium Member : ❌\n"
+        "Premium Member : ❌"
+        f"{expired_line}\n"
         f"Free Downloads : Remaining {remaining}/{daily_limit} downloads"
         f"{bonus_line}"
         f"{freemode_note}"
@@ -2986,6 +2997,7 @@ async def _send_premium_expiry_reminders(client: Client) -> None:
         delta = premium_until - now
         set_fields = {}
         try:
+            until_str = premium_until.strftime('%Y-%m-%d %H:%M UTC')
             if delta.total_seconds() <= 0:
                 if not reminders.get("expired_sent"):
                     # Avoid mass messaging historical expired users on first deploy.
@@ -2994,21 +3006,21 @@ async def _send_premium_expiry_reminders(client: Client) -> None:
                     if recently_expired:
                         await client.send_message(
                             user_id,
-                            "⚠️ Your premium plan has ended.\nUse /premium to renew and continue premium benefits."
+                            f"⚠️ Your premium plan ended on {until_str}.\nUse /premium to renew and continue premium benefits."
                         )
                     set_fields["premium_reminders.expired_sent"] = True
             elif delta <= timedelta(hours=3):
                 if not reminders.get("h3_sent"):
                     await client.send_message(
                         user_id,
-                        "⏰ Reminder: Your premium plan will expire in about 3 hours."
+                        f"⏰ Reminder: Your premium plan will expire in about 3 hours ({until_str})."
                     )
                     set_fields["premium_reminders.h3_sent"] = True
             elif delta <= timedelta(days=1):
                 if not reminders.get("d1_sent"):
                     await client.send_message(
                         user_id,
-                        "📅 Reminder: Your premium plan will expire in about 1 day."
+                        f"📅 Reminder: Your premium plan will expire in about 1 day ({until_str})."
                     )
                     set_fields["premium_reminders.d1_sent"] = True
         except Exception:
@@ -3415,8 +3427,19 @@ async def gift_cb(client, callback_query):
                 uid = doc.get("user_id")
                 if not isinstance(uid, int):
                     continue
-                await _apply_gift_days(uid, days)
+                new_until = await _apply_gift_days(uid, days)
                 updated += 1
+                if days > 0 and new_until:
+                    try:
+                        sign = "+" if days >= 0 else ""
+                        await client.send_message(
+                            uid,
+                            f"🎁 Good news! You received {sign}{days} days of bonus premium!\n"
+                            f"Your premium is now active until: {new_until.strftime('%Y-%m-%d %H:%M UTC')}",
+                        )
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        pass
             _gift_flow.pop(user_id, None)
             await _notify_admin(
                 client,
@@ -3443,8 +3466,19 @@ async def gift_cb(client, callback_query):
                 uid = doc.get("user_id")
                 if not isinstance(uid, int):
                     continue
-                await _apply_gift_days(uid, days)
+                new_until = await _apply_gift_days(uid, days)
                 updated += 1
+                if days > 0 and new_until:
+                    try:
+                        sign = "+" if days >= 0 else ""
+                        await client.send_message(
+                            uid,
+                            f"🎁 Good news! You received {sign}{days} days of bonus premium!\n"
+                            f"Your premium is now active until: {new_until.strftime('%Y-%m-%d %H:%M UTC')}",
+                        )
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        pass
             _gift_flow.pop(user_id, None)
             await _notify_admin(
                 client,
