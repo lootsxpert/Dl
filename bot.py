@@ -5,6 +5,7 @@ import hmac
 import html
 import logging
 import json
+import math
 import random
 import re
 import string
@@ -91,7 +92,7 @@ DISKWALA_API_BASE = os.getenv("DISKWALA_API_BASE", "http://teradl.kingx.dev:8080
 # Primary provider (teraboxdl.site) - API key header auth.
 TERABOXDL_API_BASE = os.getenv("TERABOXDL_API_BASE", "https://api.teraboxdl.site").strip().rstrip("/")
 # DiskWala links use the diskwala extract route; /v1/api is TeraBox-only.
-TERABOXDL_API_PATH = os.getenv("TERABOXDL_API_PATH", "/api/v1/diskwala/extract").strip()
+TERABOXDL_API_PATH = os.getenv("TERABOXDL_API_PATH", "/v1/diskwala/extract").strip()
 TERABOXDL_API_KEY = os.getenv("TERABOXDL_API_KEY", "").strip()
 BOT_USERNAME = os.getenv('BOT_USERNAME')
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
@@ -162,6 +163,9 @@ logger.setLevel(logging.INFO)
 user_data: dict[int, dict] = {}
 # user_id -> asyncio.Lock() (prevents race conditions on credits)
 user_locks: dict[int, asyncio.Lock] = {}
+# user_id -> timestamp of last processed link (for 30s per-user rate limit)
+user_last_request: dict[int, float] = {}
+USER_COOLDOWN_SECONDS = int(os.getenv("USER_COOLDOWN_SECONDS", "30"))
 # unlock_token -> {"user_id": int, "used": bool, "expires_at": float}
 tokens: dict[str, dict] = {}
 # stream_token -> {"url": str, "expires_at": float}
@@ -411,6 +415,8 @@ async def _apply_gift_days(user_id: int, days: int) -> datetime | None:
             "premium_until": new_until,
             "updated_at": now,
             "last_plan": "gift",
+            "last_gift_at": now,
+            "last_gift_days": int(days),
             "premium_reminders": {},
             "premium_tracking_enabled": True,
         }},
@@ -1444,6 +1450,15 @@ def _looks_like_diskwala(url: str) -> bool:
     return any(x in u for x in DISKWALA_DOMAIN_KEYWORDS)
 
 
+def _normalize_diskwala_url(url: str) -> str:
+    """Normalize any diskwala link format (/file/, /c/, /d/, /video/) to /app/FILE_ID."""
+    target_url = (url or "").strip()
+    match = re.search(r"diskwala\.com/(?:app|c|d|file|video)/([a-zA-Z0-9]+)", target_url, re.IGNORECASE)
+    if match:
+        return f"https://www.diskwala.com/app/{match.group(1)}"
+    return target_url
+
+
 def _supported_diskwala_domains_text() -> str:
     return "\n".join(f"- {domain}" for domain in SUPPORTED_DISKWALA_DOMAINS)
 
@@ -2256,8 +2271,12 @@ def _tbx_size_to_bytes(value) -> int:
 
 
 def _tbx_build_name(entry: dict, fallback: str = "file") -> str:
-    name = (entry.get("name") or fallback or "file").strip()
+    name = (entry.get("file_name") or entry.get("name") or fallback or "file").strip()
     ext = (entry.get("extension") or "").strip().lstrip(".")
+    if not ext and entry.get("type"):
+        t = str(entry.get("type")).lower()
+        if "/" in t:
+            ext = t.split("/")[-1].split(";")[0].strip()
     if ext and not name.lower().endswith(f".{ext.lower()}"):
         return f"{name}.{ext}"
     return name
@@ -2266,20 +2285,20 @@ def _tbx_build_name(entry: dict, fallback: str = "file") -> str:
 def _tbx_normalize_entry(entry: dict, parent: dict | None = None) -> dict | None:
     """Map one API file object to the bot's internal result shape.
 
-    Handles all three observed layouts: docs single-video (top-level url/
-    download_url/stream_url), the live fileInfo object, and playlist files[].
+    Handles Diskwala single-video (top-level download_url/stream_url/file_name),
+    docs single-video, live fileInfo object, and playlist files[].
     """
     parent = parent or {}
     direct_url = (
-        entry.get("download_url") or entry.get("url")
-        or parent.get("download_url") or parent.get("url") or ""
+        entry.get("download_url") or entry.get("url") or entry.get("link")
+        or parent.get("download_url") or parent.get("url") or parent.get("link") or ""
     ).strip()
     if not direct_url:
         return None
 
-    full_name = _tbx_build_name(entry, fallback=parent.get("name") or "file")
+    full_name = _tbx_build_name(entry, fallback=parent.get("file_name") or parent.get("name") or "file")
     size_bytes = _tbx_size_to_bytes(
-        entry.get("bytes") or entry.get("size") or parent.get("size") or 0
+        entry.get("size") or entry.get("bytes") or parent.get("size") or parent.get("bytes") or 0
     )
     thumbnail = (
         entry.get("thumbnail") or entry.get("thumb")
@@ -2303,14 +2322,17 @@ def _tbx_normalize_entry(entry: dict, parent: dict | None = None) -> dict | None
 
 
 def _tbx_parse_payload(data: dict) -> tuple[dict | None, int]:
-    """Return (first playable file, total files found).
+    """Return (first playable file, total files found)."""
+    if not isinstance(data, dict):
+        return None, 0
 
-    data may be a dict (fileInfo / playlist / single-video shapes) or a plain
-    list of file objects, e.g. the cached single-video response where data is
-    `[{_id, name, type, thumb, url, download_url, stream_url, ...}]`.
-    """
+    # 1. Direct Diskwala single-file response (fields directly at root)
+    if data.get("download_url") or data.get("stream_url") or data.get("url"):
+        res = _tbx_normalize_entry(data)
+        if res:
+            return res, 1
+
     payload = data.get("data")
-
     if isinstance(payload, list):
         entries = [f for f in payload if isinstance(f, dict)]
         for entry in entries:
@@ -2319,26 +2341,27 @@ def _tbx_parse_payload(data: dict) -> tuple[dict | None, int]:
                 return result, len(entries)
         return None, len(entries)
 
-    if not isinstance(payload, dict):
-        return None, 0
+    if isinstance(payload, dict):
+        files = payload.get("files")
+        if isinstance(files, list) and files:
+            entries = [f for f in files if isinstance(f, dict)]
+            for entry in entries:
+                result = _tbx_normalize_entry(entry, parent=payload)
+                if result:
+                    return result, len(entries)
+            return None, len(entries)
 
-    files = payload.get("files")
-    if isinstance(files, list) and files:
-        entries = [f for f in files if isinstance(f, dict)]
-        for entry in entries:
-            result = _tbx_normalize_entry(entry, parent=payload)
+        info = payload.get("fileInfo")
+        if isinstance(info, dict):
+            result = _tbx_normalize_entry(info, parent=payload)
             if result:
-                return result, len(entries)
-        return None, len(entries)
+                return result, 1
 
-    info = payload.get("fileInfo")
-    if isinstance(info, dict):
-        result = _tbx_normalize_entry(info, parent=payload)
+        result = _tbx_normalize_entry(payload)
         if result:
             return result, 1
 
-    result = _tbx_normalize_entry(payload)
-    return result, (1 if result else 0)
+    return None, 0
 
 
 async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
@@ -2350,7 +2373,8 @@ async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
     if not TERABOXDL_API_KEY:
         return None, "TeraboxDL API key is not configured."
 
-    body = json.dumps({"url": url}, separators=(",", ":"))
+    target_url = _normalize_diskwala_url(url)
+    body = json.dumps({"url": target_url}, separators=(",", ":"))
     headers = {
         "Content-Type": "application/json",
         "X-API-Key": TERABOXDL_API_KEY,
@@ -2422,17 +2446,32 @@ async def _fetch_kingx_link(url: str) -> tuple[dict | None, str]:
     if not DISKWALA_API_KEY:
         return None, "DiskWala API key is not configured."
 
+    target_url = _normalize_diskwala_url(url)
+
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
-                f"{DISKWALA_API_BASE}/",
-                params={"url": url, "key": DISKWALA_API_KEY},
+                f"{DISKWALA_API_BASE}/task",
+                params={"url": target_url, "key": DISKWALA_API_KEY},
             ) as resp:
+                text = await resp.text()
+                if resp.status == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    detail = _extract_api_error(text) or "API cooldown active"
+                    cooldown_msg = f"{detail} (Retry after {retry_after}s)" if retry_after else detail
+                    _record_api_result("diskwala", False, f"HTTP 429: {cooldown_msg}")
+                    return None, f"{_RATE_LIMIT_MARKER}{cooldown_msg}"
+
                 if resp.status != 200:
-                    _record_api_result("diskwala", False, f"HTTP {resp.status}")
-                    return None, f"API error HTTP {resp.status}"
-                data = await resp.json(content_type=None)
+                    err_msg = _extract_api_error(text) or f"HTTP {resp.status}"
+                    _record_api_result("diskwala", False, f"HTTP {resp.status}: {err_msg}")
+                    return None, f"DiskWala API error: {err_msg}"
+
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = None
     except Exception as e:
         _record_api_result("diskwala", False, f"{type(e).__name__}: {e}")
         return None, "Failed to fetch data."
@@ -2441,17 +2480,42 @@ async def _fetch_kingx_link(url: str) -> tuple[dict | None, str]:
         _record_api_result("diskwala", False, "invalid response")
         return None, "Failed to fetch data."
 
-    direct_url = (data.get("direct_url") or "").strip()
+    payload = data
+    if isinstance(data.get("data"), dict):
+        payload = data["data"]
+    elif isinstance(data.get("result"), dict):
+        payload = data["result"]
+
+    direct_url = (
+        payload.get("direct_url")
+        or payload.get("download_url")
+        or payload.get("url")
+        or payload.get("link")
+        or ""
+    ).strip()
+
     if not direct_url:
-        api_msg = data.get("message") or data.get("error") or "No direct url in response."
+        api_msg = data.get("message") or data.get("error") or data.get("detail") or "No direct url in response."
         _record_api_result("diskwala", False, str(api_msg))
         return None, str(api_msg)
 
-    size_bytes = int(data.get("size") or 0)
-    full_name = _normalize_diskwala_filename(data)
-    thumbnail = (data.get("thumbnail") or "").strip()
-    media_type = (data.get("type") or "").lower()
-    stream = direct_url if media_type.startswith("video") else ""
+    if direct_url.startswith("/"):
+        direct_url = urljoin(DISKWALA_API_BASE, direct_url)
+
+    size_bytes = _tbx_size_to_bytes(
+        payload.get("size") or payload.get("bytes") or payload.get("file_size") or 0
+    )
+    full_name = _normalize_diskwala_filename(payload)
+    thumbnail = (
+        payload.get("thumbnail")
+        or payload.get("thumb")
+        or payload.get("icon")
+        or ""
+    ).strip()
+    media_type = (payload.get("type") or payload.get("mime_type") or "").lower()
+    stream = (payload.get("stream") or payload.get("stream_url") or "").strip()
+    if not stream and (media_type.startswith("video") or full_name.lower().endswith((".mp4", ".mkv", ".webm"))):
+        stream = direct_url
 
     _record_api_result("diskwala", True)
     return {
@@ -2481,6 +2545,8 @@ async def fetch_diskwala_link(url: str) -> tuple[dict | None, str]:
     result, err = await _fetch_kingx_link(url)
     if result:
         return result, ""
+    if err.startswith(_RATE_LIMIT_MARKER):
+        return None, err
     logger.warning("Both APIs failed. primary=%s fallback=%s", primary_err, err)
     if primary_err and err:
         return None, f"{primary_err} (fallback: {err})"
@@ -3326,13 +3392,14 @@ async def gift_cmd(client, message):
     if user_id not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
     _gift_flow.pop(user_id, None)
+    bot_label = f"@{client.me.username}" if client.me and getattr(client.me, "username", None) else (getattr(client, "bot_key", "") or "This Bot")
     await message.reply(
-        "🎁 <b>Gift premium</b>\n\n"
-        "Who do you want to grant premium to?",
+        f"🎁 <b>Gift premium ({bot_label})</b>\n\n"
+        f"Who do you want to grant premium to on <b>{bot_label}</b>?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💎 All current premium", callback_data="gift:premium")],
-            [InlineKeyboardButton("🌐 All users", callback_data="gift:all")],
+            [InlineKeyboardButton(f"💎 Current Premium ({bot_label})", callback_data="gift:premium")],
+            [InlineKeyboardButton(f"🤖 All Users ({bot_label})", callback_data="gift:all")],
             [InlineKeyboardButton("👤 Specific user", callback_data="gift:user")],
             [InlineKeyboardButton("❌ Cancel", callback_data="gift:cancel")],
         ]),
@@ -3354,11 +3421,14 @@ async def gift_cb(client, callback_query):
             pass
         return await callback_query.answer()
 
+    bot_key = getattr(client, "bot_key", None) or _sanitize_bot_key(client.me.username if client.me else "")
+    bot_label = f"@{client.me.username}" if client.me and getattr(client.me, "username", None) else (bot_key or "this bot")
+
     if action == "premium":
         _gift_flow[user_id] = {"scope": "premium", "step": "days"}
         try:
             await callback_query.message.edit(
-                "💎 Extending premium for <b>all currently active premium users</b>.\n\n"
+                f"💎 Extending premium for active premium users of <b>{bot_label}</b>.\n\n"
                 "How many days do you want to add? (use a negative number to subtract)\n"
                 "Reply to this message with the number.",
                 parse_mode=ParseMode.HTML,
@@ -3376,7 +3446,7 @@ async def gift_cb(client, callback_query):
         _gift_flow[user_id] = {"scope": "all", "step": "days"}
         try:
             await callback_query.message.edit(
-                "🌐 Extending premium for <b>all users</b>.\n\n"
+                f"🤖 Extending premium for all users of <b>{bot_label}</b>.\n\n"
                 "How many days do you want to add? (use a negative number to subtract)\n"
                 "Reply to this message with the number.",
                 parse_mode=ParseMode.HTML,
@@ -3421,12 +3491,27 @@ async def gift_cb(client, callback_query):
         if flow["scope"] == "all":
             if users_col is None:
                 return await callback_query.answer("DB not configured.", show_alert=True)
-            cursor = users_col.find({}, {"user_id": 1})
+            now = _utc_now()
+            # Only extend users that belong to THIS bot
+            query = {"bot_keys": bot_key} if bot_key else {}
+            cursor = users_col.find(query, {"user_id": 1, "premium_until": 1, "last_gift_at": 1})
             updated = 0
+            skipped = 0
+            already_gifted = 0
             async for doc in cursor:
                 uid = doc.get("user_id")
                 if not isinstance(uid, int):
                     continue
+
+                # Deduplication: If adding days and user was already gifted within the last 12 hours (e.g. by another bot sharing the DB), skip to prevent multi-bot multiplication
+                last_gift = doc.get("last_gift_at")
+                if days > 0 and isinstance(last_gift, datetime):
+                    if last_gift.tzinfo is None:
+                        last_gift = last_gift.replace(tzinfo=timezone.utc)
+                    if (now - last_gift) < timedelta(hours=12):
+                        already_gifted += 1
+                        continue
+
                 new_until = await _apply_gift_days(uid, days)
                 updated += 1
                 if days > 0 and new_until:
@@ -3443,11 +3528,14 @@ async def gift_cb(client, callback_query):
             _gift_flow.pop(user_id, None)
             await _notify_admin(
                 client,
-                f"🎁 /gift (all): {days:+d} days applied to {updated} users.",
+                f"🎁 /gift (all - {bot_label}): {days:+d} days applied to {updated} users "
+                f"({already_gifted} already gifted recently, {skipped} skipped).",
             )
             try:
                 await callback_query.message.edit(
-                    f"✅ Done. Applied {days:+d} days to {updated} users."
+                    f"✅ Done on {bot_label}!\n\n"
+                    f"• Applied {days:+d} days to: <b>{updated}</b> users\n"
+                    f"• Already gifted recently (skipped): <b>{already_gifted}</b>"
                 )
             except Exception:
                 pass
@@ -3457,15 +3545,30 @@ async def gift_cb(client, callback_query):
             if users_col is None:
                 return await callback_query.answer("DB not configured.", show_alert=True)
             now = _utc_now()
+            # Only users of THIS bot whose premium_until is in the future.
+            query = {"premium_until": {"$gt": now}}
+            if bot_key:
+                query["bot_keys"] = bot_key
             cursor = users_col.find(
-                {"premium_until": {"$gt": now}},
-                {"user_id": 1, "premium_until": 1},
+                query,
+                {"user_id": 1, "premium_until": 1, "last_gift_at": 1},
             )
             updated = 0
+            already_gifted = 0
             async for doc in cursor:
                 uid = doc.get("user_id")
                 if not isinstance(uid, int):
                     continue
+
+                # Deduplication: If adding days and user was already gifted within 12 hours, skip
+                last_gift = doc.get("last_gift_at")
+                if days > 0 and isinstance(last_gift, datetime):
+                    if last_gift.tzinfo is None:
+                        last_gift = last_gift.replace(tzinfo=timezone.utc)
+                    if (now - last_gift) < timedelta(hours=12):
+                        already_gifted += 1
+                        continue
+
                 new_until = await _apply_gift_days(uid, days)
                 updated += 1
                 if days > 0 and new_until:
@@ -3482,11 +3585,14 @@ async def gift_cb(client, callback_query):
             _gift_flow.pop(user_id, None)
             await _notify_admin(
                 client,
-                f"🎁 /gift (premium): {days:+d} days applied to {updated} active premium users.",
+                f"🎁 /gift (premium - {bot_label}): {days:+d} days applied to {updated} active premium users "
+                f"({already_gifted} already gifted recently).",
             )
             try:
                 await callback_query.message.edit(
-                    f"✅ Done. Applied {days:+d} days to {updated} currently active premium users."
+                    f"✅ Done on {bot_label}!\n\n"
+                    f"• Applied {days:+d} days to: <b>{updated}</b> active premium users\n"
+                    f"• Already gifted recently (skipped): <b>{already_gifted}</b>"
                 )
             except Exception:
                 pass
@@ -3835,23 +3941,58 @@ async def usage_cmd(client, message):
     await _upsert_user_profile(message.from_user, client.bot_key)
     if int(user_id) not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
-    if not DISKWALA_API_KEY:
-        return await message.reply("DISKWALA_API_KEY is not configured.")
 
     status = await message.reply("Fetching usage info...")
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                f"{DISKWALA_API_BASE}/usage",
-                params={"key": DISKWALA_API_KEY},
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        return await status.edit(f"Failed to fetch usage: {e}")
+    lines = ["📊 **API Quota & Usage**\n"]
 
-    await status.edit(_format_api_usage(data))
+    # 1. Primary: TeraboxDL
+    if TERABOXDL_API_KEY:
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"{TERABOXDL_API_BASE}/v1/diskwala/quota",
+                    headers={"X-API-Key": TERABOXDL_API_KEY},
+                ) as resp:
+                    if resp.status == 200:
+                        tdata = await resp.json(content_type=None)
+                        lines.append("⚡ **TeraboxDL (Primary):**")
+                        lines.append(f"• Credits: `{tdata.get('diskwala_credits', 'N/A')}`")
+                        lines.append(f"• Used: `{tdata.get('diskwala_requests_used', 'N/A')}`")
+                        lines.append(f"• Plan: `{tdata.get('diskwala_plan', 'N/A')}`")
+                        lines.append(f"• Rate Limit: `{tdata.get('rate_limit', 'N/A')}/min`\n")
+                    else:
+                        lines.append(f"⚡ **TeraboxDL:** HTTP {resp.status}\n")
+        except Exception as e:
+            lines.append(f"⚡ **TeraboxDL:** Error ({e})\n")
+    else:
+        lines.append("⚡ **TeraboxDL:** Key not configured\n")
+
+    # 2. Fallback: Kingx
+    if DISKWALA_API_KEY:
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"{DISKWALA_API_BASE}/get/apikey",
+                    params={"key": DISKWALA_API_KEY},
+                ) as resp:
+                    if resp.status == 200:
+                        kdata = await resp.json(content_type=None)
+                        lines.append("🛡 **Kingx (Fallback):**")
+                        lines.append(f"• Account: `{kdata.get('name', 'N/A')}`")
+                        lines.append(f"• Daily Limit: `{kdata.get('daily_limit', 'N/A')}`")
+                        lines.append(f"• Remaining Today: `{kdata.get('remaining_today', 'N/A')}`")
+                        lines.append(f"• Cooldown: `{kdata.get('cooldown_seconds', 'N/A')}s`\n")
+                    else:
+                        lines.append(f"🛡 **Kingx:** HTTP {resp.status}\n")
+        except Exception as e:
+            lines.append(f"🛡 **Kingx:** Error ({e})\n")
+    else:
+        lines.append("🛡 **Kingx:** Key not configured\n")
+
+    lines.append(f"⏱ **User Cooldown Setting:** `{USER_COOLDOWN_SECONDS}s` per link")
+    await status.edit("\n".join(lines))
 
 
 # ----- Main catch-all: diskwala links -----
@@ -3903,80 +4044,128 @@ async def diskwala(client, message):
             await _reply_invalid_link_once(client, message, user_id)
             return
 
-        for idx, url in enumerate(diskwala_urls[:MAX_LINKS_PER_MESSAGE], start=1):
-            if FREE_MODE_ENABLED:
-                # Free mode: still consume a credit slot so the user can't burn
-                # unlimited downloads, but treat them as premium (50/day cap)
-                # so they get the higher daily limit.
-                ok_credit, is_premium, daily_limit = await reserve_credit(user_id, force_premium=True)
-            else:
-                ok_credit, is_premium, daily_limit = await reserve_credit(user_id)
-            if not ok_credit:
-                if is_premium:
-                    await message.reply(
-                        f"💎 Premium daily limit reached ({daily_limit}/day). Please try again after UTC midnight."
-                    )
-                    await send_quota_topup_menu(message, user_id, daily_limit=daily_limit)
-                else:
-                    if QUOTA_ENABLED:
-                        await send_unlock_once(client, message, user_id)
-                    else:
-                        await send_premium_required_once(client, message, user_id)
-                return
-
-            msg = await message.reply(f"Fetching ({idx}/{len(diskwala_urls[:MAX_LINKS_PER_MESSAGE])})...")
-            result, err_msg = await fetch_diskwala_link(url)
-
-            if not result:
-                if err_msg.startswith(_RATE_LIMIT_MARKER):
-                    await msg.edit(
-                        "⚠️ **High traffic right now.**\n\n"
-                        "Too many users are trying to fetch the same file at once. "
-                        "Please wait a couple of minutes and try again.\n\n"
-                        "Your download credit has been refunded.",
-                        reply_markup=_support_markup(),
-                    )
-                else:
-                    await msg.edit(
-                        f"Failed ❌\n\n{err_msg}",
-                        reply_markup=_support_markup(),
-                    )
-                # refund reserved credit because request didn't succeed
-                await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
-                continue
-
-            name = result["name"]
-            size_mb = result["size_mb"]
-            link = result["link"]
-            stream = result.get("stream", "")
-            thumbnail = result["thumbnail"]
-
-            ftoken = create_file_token(link, name, size_mb, stream, user_id)
-            caption = _file_options_caption(name, size_mb, has_stream=bool(stream))
-            markup = _build_file_options_markup(
-                ftoken,
-                stream=stream,
-                name=name,
-                size_mb=size_mb,
-                download_url=link,
-                is_premium=is_premium,
+        user_lock = user_locks.setdefault(user_id, asyncio.Lock())
+        if user_lock.locked():
+            return await message.reply(
+                "⏳ **Your previous link is still being processed.**\n\n"
+                "Please wait a moment for it to complete."
             )
 
-            if not markup:
-                await msg.edit(
-                    f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No delivery options available.",
-                    reply_markup=_support_markup(),
+        async with user_lock:
+            # Check 30s per-user rate limit before starting new message/batch
+            now = _now_ts()
+            last_req = user_last_request.get(user_id, 0)
+            elapsed = now - last_req
+            if not _is_admin_user(user_id) and elapsed < USER_COOLDOWN_SECONDS:
+                remaining = int(math.ceil(USER_COOLDOWN_SECONDS - elapsed))
+                return await message.reply(
+                    f"⚠️ **You are sending links too fast!**\n\n"
+                    f"Please wait **{remaining} seconds** before sending another link.\n\n"
+                    f"*(Limit: 1 link per {USER_COOLDOWN_SECONDS}s to prevent rate limits)*"
                 )
-                continue
 
-            await _send_file_options_message(
-                client,
-                message,
-                msg,
-                caption=caption,
-                markup=markup,
-                thumbnail=thumbnail,
-            )
+            total_links = len(diskwala_urls[:MAX_LINKS_PER_MESSAGE])
+            for idx, url in enumerate(diskwala_urls[:MAX_LINKS_PER_MESSAGE], start=1):
+                # Cooldown between multiple links in the same post
+                if idx > 1:
+                    wait_time = int(math.ceil(USER_COOLDOWN_SECONDS - (_now_ts() - user_last_request.get(user_id, 0))))
+                    if wait_time > 0 and not _is_admin_user(user_id):
+                        cd_msg = await message.reply(
+                            f"⏳ **Link {idx - 1} processed!**\n\n"
+                            f"To prevent server rate-limits, processing next link ({idx}/{total_links}) in **{wait_time}s**..."
+                        )
+                        while wait_time > 0:
+                            step = min(5, wait_time)
+                            await asyncio.sleep(step)
+                            wait_time = int(math.ceil(USER_COOLDOWN_SECONDS - (_now_ts() - user_last_request.get(user_id, 0))))
+                            if wait_time > 0:
+                                try:
+                                    await cd_msg.edit(
+                                        f"⏳ **Link {idx - 1} processed!**\n\n"
+                                        f"To prevent server rate-limits, processing next link ({idx}/{total_links}) in **{wait_time}s**..."
+                                    )
+                                except Exception:
+                                    pass
+                        try:
+                            await cd_msg.delete()
+                        except Exception:
+                            pass
+
+                user_last_request[user_id] = _now_ts()
+
+                if FREE_MODE_ENABLED:
+                    # Free mode: still consume a credit slot so the user can't burn
+                    # unlimited downloads, but treat them as premium (50/day cap)
+                    # so they get the higher daily limit.
+                    ok_credit, is_premium, daily_limit = await reserve_credit(user_id, force_premium=True)
+                else:
+                    ok_credit, is_premium, daily_limit = await reserve_credit(user_id)
+                if not ok_credit:
+                    if is_premium:
+                        await message.reply(
+                            f"💎 Premium daily limit reached ({daily_limit}/day). Please try again after UTC midnight."
+                        )
+                        await send_quota_topup_menu(message, user_id, daily_limit=daily_limit)
+                    else:
+                        if QUOTA_ENABLED:
+                            await send_unlock_once(client, message, user_id)
+                        else:
+                            await send_premium_required_once(client, message, user_id)
+                    return
+
+                msg = await message.reply(f"Fetching ({idx}/{total_links})...")
+                result, err_msg = await fetch_diskwala_link(url)
+
+                if not result:
+                    if err_msg.startswith(_RATE_LIMIT_MARKER):
+                        await msg.edit(
+                            "⚠️ **High traffic right now.**\n\n"
+                            "Too many users are trying to fetch the same file at once. "
+                            "Please wait a couple of minutes and try again.\n\n"
+                            "Your download credit has been refunded.",
+                            reply_markup=_support_markup(),
+                        )
+                    else:
+                        await msg.edit(
+                            f"Failed ❌\n\n{err_msg}",
+                            reply_markup=_support_markup(),
+                        )
+                    # refund reserved credit because request didn't succeed
+                    await refund_reserved_credit(user_id, daily_limit=daily_limit, n=1)
+                    continue
+
+                name = result["name"]
+                size_mb = result["size_mb"]
+                link = result["link"]
+                stream = result.get("stream", "")
+                thumbnail = result["thumbnail"]
+
+                ftoken = create_file_token(link, name, size_mb, stream, user_id)
+                caption = _file_options_caption(name, size_mb, has_stream=bool(stream))
+                markup = _build_file_options_markup(
+                    ftoken,
+                    stream=stream,
+                    name=name,
+                    size_mb=size_mb,
+                    download_url=link,
+                    is_premium=is_premium,
+                )
+
+                if not markup:
+                    await msg.edit(
+                        f"📁 {name}\n📦 {size_mb} MB\n\n⚠️ No delivery options available.",
+                        reply_markup=_support_markup(),
+                    )
+                    continue
+
+                await _send_file_options_message(
+                    client,
+                    message,
+                    msg,
+                    caption=caption,
+                    markup=markup,
+                    thumbnail=thumbnail,
+                )
 
     except Exception as e:
         await report_error(client, "diskwala_handler", e, extra={"user_id": user_id})
