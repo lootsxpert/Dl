@@ -52,12 +52,13 @@ except Exception:
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 load_dotenv()
 BOT_BOOT_TIME_UTC = datetime.now(timezone.utc)
 
 # Telegram allows bots to upload up to 2 GB; override via TELEGRAM_MAX_UPLOAD_MB if needed.
 TELEGRAM_MAX_UPLOAD_MB = float(os.getenv("TELEGRAM_MAX_UPLOAD_MB", "2048"))
-LIMIT_FREE_REQUESTS = 3
+LIMIT_FREE_REQUESTS = int(os.getenv("LIMIT_FREE_REQUESTS", "2"))
 STREAM_TOKEN_TTL_SECONDS = 15 * 60  # 15 minutes
 MAX_LINKS_PER_MESSAGE = 3
 UNLOCK_PROMPT_COOLDOWN_SECONDS = 90
@@ -163,6 +164,8 @@ logger.setLevel(logging.INFO)
 user_data: dict[int, dict] = {}
 # user_id -> asyncio.Lock() (prevents race conditions on credits)
 user_locks: dict[int, asyncio.Lock] = {}
+# user_ids currently having a link processed (prevents duplicate simultaneous requests)
+_user_processing: set[int] = set()
 # user_id -> timestamp of last processed link (for 30s per-user rate limit)
 user_last_request: dict[int, float] = {}
 USER_COOLDOWN_SECONDS = int(os.getenv("USER_COOLDOWN_SECONDS", "30"))
@@ -206,12 +209,13 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on", "enabled")
 
 
-# Admin toggles. Changed at runtime by the /freemode_* and
-# /sendfile_* commands, but those changes are in-memory only and are lost on
+# Admin toggles. Changed at runtime by the /freemode_*, /sendfile_*,
+# /maintenance_*, and /refer_* commands, but those changes are in-memory only and are lost on
 # every restart or deploy, so the startup state comes from these env vars.
 FREE_MODE_ENABLED = _env_flag("FREE_MODE_ENABLED", False)  # /freemode_on|off - when True, bot is free for everyone
 SENDFILE_ENABLED = _env_flag("SENDFILE_ENABLED", False)  # /sendfile_on|off - when False, Get File (Premium) shows admin-disabled popup
 MAINTENANCE_MODE = _env_flag("MAINTENANCE_MODE", False)  # /maintenance_on|off - when True, all non-admin users get the maintenance reply
+REFERRAL_ENABLED = _env_flag("REFERRAL_ENABLED", False)  # /refer_on|off - when False, refer & earn is disabled
 
 # In-memory per-API usage/health counters (not persisted; reset on restart).
 # api_key -> {attempts, success, fail, consecutive_fails, last_ok_at, last_fail_at, last_error}
@@ -759,8 +763,9 @@ async def _referral_stats_text(bot_key: str) -> str:
     except Exception:
         pass
 
+    status_tag = " [ENABLED]" if REFERRAL_ENABLED else " [DISABLED]"
     return (
-        "🤝 Referrals\n"
+        f"🤝 Referrals{status_tag}\n"
         f"Total confirmed: {total}\n"
         f"{top_line}"
     )
@@ -798,7 +803,8 @@ async def _status_text(bot_key: str) -> str:
             "Premium users: DB not enabled\n"
             f"In-memory users today: {total_users}\n\n"
             f"Toggles: freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
-            f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
+            f"sendfile={'on' if SENDFILE_ENABLED else 'off'} | "
+            f"refer={'on' if REFERRAL_ENABLED else 'off'}\n\n"
             f"{api_text}"
         )
     else:
@@ -814,7 +820,8 @@ async def _status_text(bot_key: str) -> str:
             f"Premium expired users: {expired_premium_users}\n"
             f"Active users (last 24h): {active_today}\n\n"
             f"Toggles: freemode={'on' if FREE_MODE_ENABLED else 'off'} | "
-            f"sendfile={'on' if SENDFILE_ENABLED else 'off'}\n\n"
+            f"sendfile={'on' if SENDFILE_ENABLED else 'off'} | "
+            f"refer={'on' if REFERRAL_ENABLED else 'off'}\n\n"
             f"{api_text}"
         )
     if referral_text:
@@ -1423,6 +1430,9 @@ async def _ensure_joined(client: Client, message) -> bool:
     except Exception:
         return False
 
+    if _is_admin_user(user_id):
+        return True
+
     missing = await _missing_force_sub(client, user_id)
     if not missing:
         return True
@@ -1445,18 +1455,39 @@ def extract_urls(message, limit: int = MAX_LINKS_PER_MESSAGE) -> list[str]:
     return urls[: max(0, int(limit or 0))]
 
 
-def _looks_like_diskwala(url: str) -> bool:
-    u = (url or "").lower()
-    return any(x in u for x in DISKWALA_DOMAIN_KEYWORDS)
-
-
-def _normalize_diskwala_url(url: str) -> str:
-    """Normalize any diskwala link format (/file/, /c/, /d/, /video/) to /app/FILE_ID."""
-    target_url = (url or "").strip()
-    match = re.search(r"diskwala\.com/(?:app|c|d|file|video)/([a-zA-Z0-9]+)", target_url, re.IGNORECASE)
+def _extract_diskwala_file_id(url: str) -> str | None:
+    """Extract valid file ID from a Diskwala URL. Returns None for playlists, profiles, or invalid links."""
+    if not url:
+        return None
+    url_clean = (url or "").strip()
+    if "playlist" in url_clean.lower():
+        return None
+    match = re.search(r"diskwala\.com/(?:app|c|d|file|video)/([a-zA-Z0-9_-]+)", url_clean, re.IGNORECASE)
     if match:
-        return f"https://www.diskwala.com/app/{match.group(1)}"
-    return target_url
+        fid = match.group(1).strip()
+        if len(fid) >= 4:
+            return fid
+    return None
+
+
+def _is_valid_diskwala_url(url: str) -> bool:
+    """Check if the URL is a valid Diskwala single-file link."""
+    return _extract_diskwala_file_id(url) is not None
+
+
+def _looks_like_diskwala(url: str) -> bool:
+    """Strictly checks if URL points to a valid single-file Diskwala download."""
+    return _is_valid_diskwala_url(url)
+
+
+def _normalize_diskwala_url(url: str) -> str | None:
+    """Normalize any valid Diskwala link format (/file/, /c/, /d/, /video/) to https://www.diskwala.com/app/FILE_ID.
+    Returns None if not a valid single-file link so no API credits are ever spent on invalid links.
+    """
+    fid = _extract_diskwala_file_id(url)
+    if fid:
+        return f"https://www.diskwala.com/app/{fid}"
+    return None
 
 
 def _supported_diskwala_domains_text() -> str:
@@ -1700,7 +1731,7 @@ async def reserve_credit(user_id: int, force_premium: bool = False) -> tuple[boo
     (50/day) without granting real premium — used by free mode so users
     still hit a quota wall instead of getting unlimited downloads.
     """
-    is_premium = force_premium or await _is_premium_user(user_id)
+    is_premium = force_premium or await _has_premium_access(user_id)
     daily_limit = PREMIUM_DAILY_DOWNLOADS if is_premium else LIMIT_FREE_REQUESTS
     lock = _get_user_lock(user_id)
     async with lock:
@@ -2058,6 +2089,10 @@ async def send_premium_required_once(client: Client, message, user_id: int) -> b
         user = user_data.get(user_id) or {}
         last_ts = float(user.get("last_premium_prompt_ts") or 0)
         if now - last_ts < UNLOCK_PROMPT_COOLDOWN_SECONDS:
+            await message.reply(
+                f"⚠️ Your daily {LIMIT_FREE_REQUESTS} free downloads are over for today.\n\n"
+                "Please buy premium membership to continue downloading."
+            )
             return False
         user["last_premium_prompt_ts"] = now
         user_data[user_id] = user
@@ -2085,6 +2120,7 @@ async def _reply_invalid_link_once(client: Client, message, user_id: int) -> boo
         user = user_data.get(user_id) or {}
         last_ts = float(user.get("last_invalid_link_ts") or 0)
         if now - last_ts < INVALID_LINK_REPLY_COOLDOWN_SECONDS:
+            await message.reply("Please send a valid DiskWala single-file link (e.g. `https://www.diskwala.com/app/FILE_ID`).")
             return False
         user["last_invalid_link_ts"] = now
         user_data[user_id] = user
@@ -2097,6 +2133,8 @@ async def _reply_invalid_link_once(client: Client, message, user_id: int) -> boo
 async def refer_cmd(client, message):
     """Show user's referral link, stats, and a Share button."""
     user_id = int(message.from_user.id)
+    if not REFERRAL_ENABLED and int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("⚠️ Refer & Earn program is currently disabled.")
     try:
         link = await _referral_link(client, user_id)
         count = await _get_referral_count(user_id)
@@ -2374,6 +2412,8 @@ async def fetch_teraboxdl_link(url: str) -> tuple[dict | None, str]:
         return None, "TeraboxDL API key is not configured."
 
     target_url = _normalize_diskwala_url(url)
+    if not target_url:
+        return None, "Invalid DiskWala file URL. API request aborted to save credits."
     body = json.dumps({"url": target_url}, separators=(",", ":"))
     headers = {
         "Content-Type": "application/json",
@@ -2447,6 +2487,8 @@ async def _fetch_kingx_link(url: str) -> tuple[dict | None, str]:
         return None, "DiskWala API key is not configured."
 
     target_url = _normalize_diskwala_url(url)
+    if not target_url:
+        return None, "Invalid DiskWala file URL. API request aborted to save credits."
 
     try:
         timeout = aiohttp.ClientTimeout(total=30)
@@ -2600,6 +2642,9 @@ async def send_unlock_once(client: Client, message, user_id: int) -> bool:
         user = user_data.get(user_id) or {}
         last_ts = float(user.get("last_unlock_prompt_ts") or 0)
         if now - last_ts < UNLOCK_PROMPT_COOLDOWN_SECONDS:
+            await message.reply(
+                "❌ Limit reached! Please complete the previous ad unlock or buy premium to continue downloading."
+            )
             return False
         user["last_unlock_prompt_ts"] = now
         user_data[user_id] = user
@@ -3132,6 +3177,8 @@ async def start(client, message):
 
         # Refer payload: ref_<referrer_id> — mark pending and show a confirm button.
         if token.startswith("ref_"):
+            if not REFERRAL_ENABLED:
+                return await message.reply("⚠️ Refer & Earn program is currently disabled.")
             try:
                 referrer_id = int(token[4:])
             except Exception:
@@ -3191,6 +3238,8 @@ async def start(client, message):
 # ----- Referral confirmation -----
 @app.on_callback_query(filters.regex(r"^refconfirm:(\d+)$"))
 async def refconfirm_cb(client, callback_query):
+    if not REFERRAL_ENABLED:
+        return await callback_query.answer("⚠️ Refer & Earn program is currently disabled.", show_alert=True)
     user_id = int(callback_query.data.split(":", 1)[1])
     clicker = int(callback_query.from_user.id)
     if clicker != user_id:
@@ -3332,7 +3381,7 @@ async def shortlink_off_cmd(client, message):
     if int(user_id) not in ADMIN_USER_IDS:
         return await message.reply("❌ You are not allowed to use this command.")
     QUOTA_ENABLED = False
-    return await message.reply("OK. Shortlink unlock DISABLED. Free users still get 3 downloads, then must buy premium.")
+    return await message.reply(f"OK. Shortlink unlock DISABLED. Free users still get {LIMIT_FREE_REQUESTS} downloads, then must buy premium.")
 
 
 # ----- /freemode_on|off -----
@@ -3380,6 +3429,29 @@ async def maintenance_off_cmd(client, message):
     MAINTENANCE_MODE = False
     await message.reply("✅ Maintenance mode DISABLED. Bot is back to normal.")
     await _notify_admin(client, f"✅ Maintenance mode DISABLED by admin {user_id}.")
+
+
+# ----- /refer_on|off -----
+@app.on_message(filters.command("refer_on"))
+async def refer_on_cmd(client, message):
+    global REFERRAL_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    REFERRAL_ENABLED = True
+    await message.reply("✅ Referral program ENABLED. Users can refer and earn bonus downloads.")
+    await _notify_admin(client, f"✅ Referral program ENABLED by admin {user_id}.")
+
+
+@app.on_message(filters.command("refer_off"))
+async def refer_off_cmd(client, message):
+    global REFERRAL_ENABLED
+    user_id = message.from_user.id
+    if int(user_id) not in ADMIN_USER_IDS:
+        return await message.reply("❌ You are not allowed to use this command.")
+    REFERRAL_ENABLED = False
+    await message.reply("✅ Referral program DISABLED. Refer & earn links and confirmations are paused.")
+    await _notify_admin(client, f"⚠️ Referral program DISABLED by admin {user_id}.")
 
 
 # ----- /gift: grant premium to all users or a specific user (admin only) -----
@@ -3999,7 +4071,8 @@ async def usage_cmd(client, message):
 @app.on_message(filters.private & ~filters.command([
     "start", "premium", "myplan", "status", "usage", "broadcast", "broadcast_attach",
     "shortlink_on", "shortlink_off", "freemode_on", "freemode_off",
-    "sendfile_on", "sendfile_off", "refer",
+    "sendfile_on", "sendfile_off", "maintenance_on", "maintenance_off",
+    "refer_on", "refer_off", "refer",
 ]))
 async def diskwala(client, message):
     if MAINTENANCE_MODE and int(getattr(message.from_user, "id", 0) or 0) not in ADMIN_USER_IDS:
@@ -4012,15 +4085,6 @@ async def diskwala(client, message):
         )
     user_id = message.from_user.id
     await _upsert_user_profile(message.from_user, client.bot_key)
-
-    # Ignore queued old updates delivered after restart/deploy
-    # to avoid mass "invalid link" replies to historical chats.
-    msg_dt = getattr(message, "date", None)
-    if isinstance(msg_dt, datetime):
-        if msg_dt.tzinfo is None:
-            msg_dt = msg_dt.replace(tzinfo=timezone.utc)
-        if msg_dt < (BOT_BOOT_TIME_UTC - timedelta(seconds=10)):
-            return
 
     text = message.caption if message.caption else message.text
     if _is_livegram_noise(text or ""):
@@ -4038,20 +4102,43 @@ async def diskwala(client, message):
 
     try:
         urls = extract_urls(message, limit=MAX_LINKS_PER_MESSAGE)
-        diskwala_urls = [u for u in urls if _looks_like_diskwala(u)]
+        diskwala_urls = []
+        has_diskwala_domain = False
+        has_playlist = False
+
+        for u in urls:
+            if "playlist" in u.lower():
+                has_playlist = True
+            norm = _normalize_diskwala_url(u)
+            if norm:
+                diskwala_urls.append(norm)
+            elif any(k in u.lower() for k in DISKWALA_DOMAIN_KEYWORDS):
+                has_diskwala_domain = True
 
         if not diskwala_urls:
+            if has_playlist:
+                return await message.reply(
+                    "❌ **Playlists are not supported.**\n\n"
+                    "Please send a direct single-file DiskWala link (e.g. `https://www.diskwala.com/app/FILE_ID`)."
+                )
+            if has_diskwala_domain:
+                return await message.reply(
+                    "❌ **Invalid DiskWala file link.**\n\n"
+                    "Please make sure your link points directly to a single file:\n"
+                    "• Format: `https://www.diskwala.com/app/FILE_ID`\n\n"
+                    "⚠️ *Playlists, folders, and profile pages are not supported.*"
+                )
             await _reply_invalid_link_once(client, message, user_id)
             return
 
-        user_lock = user_locks.setdefault(user_id, asyncio.Lock())
-        if user_lock.locked():
+        if user_id in _user_processing:
             return await message.reply(
                 "⏳ **Your previous link is still being processed.**\n\n"
                 "Please wait a moment for it to complete."
             )
 
-        async with user_lock:
+        _user_processing.add(user_id)
+        try:
             # Check 30s per-user rate limit before starting new message/batch
             now = _now_ts()
             last_req = user_last_request.get(user_id, 0)
@@ -4166,6 +4253,8 @@ async def diskwala(client, message):
                     markup=markup,
                     thumbnail=thumbnail,
                 )
+        finally:
+            _user_processing.discard(user_id)
 
     except Exception as e:
         await report_error(client, "diskwala_handler", e, extra={"user_id": user_id})
